@@ -1,0 +1,24 @@
+# Build artifacts
+target/
+
+# Environment files (secrets should be passed at runtime)
+.env
+.env.*
+
+# Transaction logs
+*.md
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore

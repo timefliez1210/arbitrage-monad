@@ -1,0 +1,21 @@
+services:
+  arbitrage-monad:
+    build: .
+    container_name: arbitrage-monad
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist transaction logs outside container
+      - ./logs:/app/logs
+    # Optional: limit resources
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
