@@ -1,95 +1,104 @@
-## Foundry
+# Monad Arbitrage Bot
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+High-frequency arbitrage bot for Monad blockchain, exploiting price discrepancies between Uniswap V4 and Kuru orderbook.
 
-Foundry consists of:
+## Architecture
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
-
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```
+┌─────────────────────┐     ┌──────────────────────┐
+│  Rust Keeper        │     │  Solidity Contracts  │
+│  (arbitrage_monad)  │────▶│  ArbitrageAUSD.sol   │
+│                     │     │  ArbitrageUSDC.sol   │
+└─────────────────────┘     └──────────────────────┘
+         │                           │
+         ▼                           ▼
+   monadNewHeads              Uniswap V4 ◄──► Kuru OB
+   subscription                 (MON/AUSD)
 ```
 
-### Test
+## Features
 
-```shell
-$ forge test
+- **monadNewHeads support** - Early block notifications for faster execution
+- **Dynamic priority fees** - Fee scales with profit (2% of profit → priority)
+- **Parallel broadcasts** - Sends to 6 RPC endpoints simultaneously
+- **Connection pooling** - Pre-warmed HTTP clients for minimal latency
+- **Atomic nonce tracking** - Lock-free nonce management
+- **Background receipt polling** - Non-blocking tx confirmation
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Check Time | ~35-50ms (QuickNode) |
+| Δ+1 Rate | 84% with monadNewHeads |
+| Gas Limit | 3,000,000 |
+
+## Setup
+
+### Prerequisites
+
+- Rust 1.70+
+- Foundry (forge, cast)
+
+### Installation
+
+```bash
+# Clone
+git clone https://github.com/timefliez1210/arbitrage-monad.git
+cd arbitrage-monad
+
+# Install Foundry deps
+forge install
+
+# Build Rust keeper
+cd arbitrage_monad
+cargo build --release
 ```
 
-### Format
+### Configuration
 
-```shell
-$ forge fmt
+Create `.env` in project root:
+
+```env
+PRIVATE_KEY=0x...
+
+# WebSocket (monadNewHeads)
+QUICKNODE_WS=wss://...
+CHAINSTACK_WS=wss://...
+
+# HTTPS (RPC calls)
+QUICKNODE_HTTPS=https://...
+CHAINSTACK_HTTP=https://...
+ANKR_HTTPS=https://...
 ```
 
-### Gas Snapshots
+Edit `arbitrage_monad/src/config.rs` to set primary endpoints:
 
-```shell
-$ forge snapshot
+```rust
+pub const PRIMARY_WS_ENV: &str = "QUICKNODE_WS";
+pub const PRIMARY_HTTPS_ENV: &str = "QUICKNODE_HTTPS";
 ```
 
-### Anvil
+### Running
 
-```shell
-$ anvil
+```bash
+cd arbitrage_monad
+cargo run --release
 ```
 
-### Deploy
+## Contracts
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+| Contract | Description |
+|----------|-------------|
+| `ArbitrageAUSD.sol` | MON/AUSD arbitrage (Uniswap V4 ↔ Kuru) |
+| `ArbitrageUSDC.sol` | MON/USDC arbitrage (Uniswap V4 ↔ Kuru) |
+
+### Deployment
+
+```bash
+forge script script/DeployArbitrageAUSD.s.sol --rpc-url $RPC --broadcast
 ```
 
-### Cast
+## License
 
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
-    let bots: Vec<ArbBot> = vec![
-        // MON/AUSD Arbitrage Bot
-        ArbBot {
-            name: "Arbitrage MON/AUSD".to_string(),
-            address: Address::from_str("0xc2a449e9ffc17c5af00f780f7b85df2ca941c8e1").unwrap(),
-        },
-        // USDC Arbitrage Bot
-        ArbBot {
-            address: Address::from_str("0xa38500b37011734ec3f45fe4b430ebd1e8867162")?, // USDC Arb
-            name: "USDC".to_string(),
-        },
-
-
-
-        ArbBot {
-            address: Address::from_str("0x73B5220f73Ad7B3C3C03C73f43571Ad563FF67B0")?, // USDC Arb (0.15 threshold)
-            name: "USDC".to_string(),
-        },
-        ArbBot {
-            address: Address::from_str("0xde6824EB845A1327cbE0e889435769B961051B26")?, // AUSD Arb (0.15 threshold)
-            name: "AUSD".to_string(),
-        },
-
-
-        Kuru Flow Router Swap
-                // ArbBot {
-        //     address: Address::from_str("0x98C85aBe9A5bC51D382723BaBB558E5DC993D093")?, // AUSD KuruFlow
-        //     name: "AUSD-KuruFlow".to_string(),
-        // },
+MIT
