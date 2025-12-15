@@ -74,7 +74,7 @@ pub const GAS_LIMIT: u128 = 3_000_000;
 
 /// Cooldown: Skip checking a bot for N blocks after it broadcasts
 /// Set to 0 to disable (useful for high volatility periods)
-pub const COOLDOWN_BLOCKS: u64 = 1;
+pub const COOLDOWN_BLOCKS: u64 = 2;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOT CONFIGURATION
