@@ -84,8 +84,8 @@ pub const COOLDOWN_BLOCKS: u64 = 2;
 /// Format: (address, name)  
 /// Comment out bots to disable them
 pub const BOTS: &[(&str, &str)] = &[
-    ("0xc2e5ec965af80916eacfc28cae63e3bd85d195e1", "USDC-v5"),
-    ("0x1ac3741941f8a4dfe99274d78826998b4b02e671", "AUSD-v5"),
+    ("0xb6cC1c2Fb3A3980Ac7Bb8b3af98C29a8853c2646", "USDC-v6"),
+    ("0x256182440e7E69469832ea36A2e5e5Ba5eDF091D", "AUSD-v6"),
     // ("0xbee8762143c3a9f26831981d4871862fa7134d01", "Triangle-v3"),
 ];
 
