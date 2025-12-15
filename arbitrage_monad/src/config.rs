@@ -70,7 +70,7 @@ pub const BASE_MAX_FEE_GWEI: u128 = 100;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Gas limit for execute() transactions
-pub const GAS_LIMIT: u128 = 3_000_000;
+pub const GAS_LIMIT: u64 = 3_000_000;
 
 /// Cooldown: Skip checking a bot for N blocks after it broadcasts
 /// Set to 0 to disable (useful for high volatility periods)
@@ -115,7 +115,7 @@ pub fn calculate_priority_fee(profit_wei: u128) -> u128 {
     }
     
     // Calculate priority fee: (profit * scaling%) / gas_limit
-    let profit_as_gas_price = profit_wei * PROFIT_SCALING_PERCENT / 100 / GAS_LIMIT;
+    let profit_as_gas_price = profit_wei * PROFIT_SCALING_PERCENT / 100 / (GAS_LIMIT as u128);
     
     std::cmp::min(base + profit_as_gas_price, max)
 }

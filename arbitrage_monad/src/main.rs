@@ -8,13 +8,13 @@ mod config;
 use alloy::{
     network::EthereumWallet,
     primitives::Address,
-    providers::{Provider, ProviderBuilder, RootProvider},
+    providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
     sol,
-    transports::http::{Client, Http},
 };
 use config::*;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::fs::OpenOptions;
@@ -25,6 +25,37 @@ use std::collections::HashMap;
 use url::Url;
 use tokio::sync::mpsc;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZERO-COPY DESERIALIZATION STRUCTS
+// Avoids allocating HashMap/Vec/String for every field in the JSON tree
+// Uses #[serde(borrow)] to point to slices of the input string instead
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct MonadHeader<'a> {
+    #[serde(borrow)]
+    number: &'a str,
+    #[serde(borrow)]
+    timestamp: &'a str,
+    #[serde(borrow, default)]
+    commitState: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct WsParams<'a> {
+    #[serde(borrow)]
+    result: MonadHeader<'a>,
+}
+
+#[derive(Deserialize)]
+struct WsNotification<'a> {
+    #[serde(borrow)]
+    method: &'a str,
+    #[serde(borrow)]
+    params: WsParams<'a>,
+}
+
 // Arbitrage contract interface
 sol! {
     #[sol(rpc)]
@@ -34,6 +65,28 @@ sol! {
         function execute() external returns (bool);
     }
 }
+
+// Multicall3 contract interface for batching RPC calls
+sol! {
+    #[sol(rpc)]
+    contract Multicall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+        
+        function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
+    }
+}
+
+// Multicall3 address (same on all EVM chains)
+const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
 #[derive(Clone)]
 struct ArbBot {
@@ -48,7 +101,7 @@ struct TxTemplate {
     to: Address,
     calldata: alloy::primitives::Bytes,  // Pre-encoded execute() call
     chain_id: u64,
-    gas_limit: u128,
+    gas_limit: u64,  // Alloy 1.x uses u64
 }
 
 impl TxTemplate {
@@ -205,34 +258,35 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
     let wallet = EthereumWallet::from(signer);
     
     // Pre-create broadcast providers at startup (connection pooling - saves ~10-50ms per broadcast)
-    let mut broadcast_providers: Vec<Arc<RootProvider<Http<Client>>>> = vec![];
+    // Note: reqwest has TCP_NODELAY enabled by default, so we get this optimization for free!
+    let mut broadcast_providers: Vec<Arc<dyn Provider + Send + Sync>> = vec![];
     
     for (env_var, name) in BROADCAST_ENDPOINTS {
         if let Ok(url) = std::env::var(env_var) {
             if let Ok(parsed) = Url::parse(&url) {
-                let provider = ProviderBuilder::new().on_http(parsed);
+                // Use connect_http - TCP_NODELAY is enabled by default in reqwest
+                let provider = ProviderBuilder::new().connect_http(parsed);
                 broadcast_providers.push(Arc::new(provider));
-                println!("📡 {} (pre-connected)", name);
+                println!("📡 {} (TCP_NODELAY)", name);
             }
         }
     }
-    println!("🔗 Broadcast providers: {} (connection pooled)", broadcast_providers.len());
+    println!("🔗 Broadcast providers: {} (TCP_NODELAY enabled)", broadcast_providers.len());
     
     let broadcast_providers = Arc::new(broadcast_providers);
     let wallet_arc = Arc::new(wallet.clone());
     
-    // Create HTTP provider for RPC calls
+    // Create HTTP provider for RPC calls (TCP_NODELAY enabled by default in reqwest)
     let rpc_url = std::env::var(PRIMARY_HTTPS_ENV)?;
     let http_provider = ProviderBuilder::new()
-        .with_recommended_fillers()
         .wallet(wallet.clone())
-        .on_http(Url::parse(&rpc_url)?);
+        .connect_http(Url::parse(&rpc_url)?);
     let http_provider = Arc::new(http_provider);
     
     // ========== RPC HEALTH CHECK ==========
     // Test RPC latency at startup to catch slow endpoints early
     println!("\n🔍 Testing RPC latency ({})...", PRIMARY_HTTPS_ENV);
-    let health_provider = ProviderBuilder::new().on_http(Url::parse(&rpc_url)?);
+    let health_provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url)?);
     let mut latencies: Vec<u128> = vec![];
     for i in 1..=3 {
         let start = Instant::now();
@@ -257,20 +311,17 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
     println!("\n🔍 Testing pending state access...");
     use alloy::eips::BlockNumberOrTag;
     let latest_block = health_provider.get_block_number().await?;
-    let pending_result = health_provider.get_block_by_number(BlockNumberOrTag::Pending, false).await;
+    let pending_result = health_provider.get_block_by_number(BlockNumberOrTag::Pending).await;
     match pending_result {
         Ok(Some(pending_block)) => {
-            if let Some(pending_num) = pending_block.header.number {
-                let diff = pending_num.saturating_sub(latest_block);
-                if diff >= 1 {
-                    println!("✅ Pending state: Block {} (latest: {}, ahead by {})", pending_num, latest_block, diff);
-                    println!("   Provider has fresh consensus state!");
-                } else {
-                    println!("⚡ Pending state: Block {} (same as latest {})", pending_num, latest_block);
-                    println!("   Provider may not have real-time consensus - still usable");
-                }
+            let pending_num = pending_block.header.number;
+            let diff = pending_num.saturating_sub(latest_block);
+            if diff >= 1 {
+                println!("✅ Pending state: Block {} (latest: {}, ahead by {})", pending_num, latest_block, diff);
+                println!("   Provider has fresh consensus state!");
             } else {
-                println!("⚠️  Pending block has no number - unusual response");
+                println!("⚡ Pending state: Block {} (same as latest {})", pending_num, latest_block);
+                println!("   Provider may not have real-time consensus - still usable");
             }
         }
         Ok(None) => {
@@ -285,7 +336,7 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
     
     // Atomic nonce tracking - single shared nonce for all bots (same wallet)
     let initial_nonce = {
-        let provider = ProviderBuilder::new().on_http(Url::parse(&rpc_url)?);
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url)?);
         provider.get_transaction_count(wallet_address).await?
     };
     let shared_nonce = Arc::new(AtomicU64::new(initial_nonce));
@@ -293,6 +344,15 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
     println!("👛 Wallet: {:?}", wallet_address);
     println!("🔢 Initial nonce: {}", initial_nonce);
     println!("⚡ Dynamic signing + connection pooling enabled");
+    
+    // ========== BACKGROUND LOG CHANNEL ==========
+    // Non-blocking logging - hot-path uses try_send() which never blocks
+    let (log_tx, mut log_rx) = mpsc::channel::<String>(500);
+    tokio::spawn(async move {
+        while let Some(msg) = log_rx.recv().await {
+            println!("{}", msg);
+        }
+    });
     
     // Background receipt polling - moves receipt fetching OFF the critical path
     let (receipt_tx, mut receipt_rx) = mpsc::channel::<ReceiptRequest>(100);
@@ -407,259 +467,203 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
     while let Some(msg_result) = ws_stream.next().await {
         match msg_result {
             Ok(Message::Text(text)) => {
-                // Parse the notification
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                    // Check if it's a subscription notification
-                    if json.get("method") == Some(&serde_json::json!("eth_subscription")) {
-                        if let Some(params) = json.get("params") {
-                            if let Some(result) = params.get("result") {
-                                // For monadNewHeads: only act on "Proposed" state (earliest notification)
-                                // For standard newHeads: commitState won't exist, so process all blocks
-                                let commit_state = result.get("commitState")
-                                    .and_then(|s| s.as_str());
-                                
-                                // Skip if monadNewHeads and not "Proposed" (wait for earliest signal)
-                                // But process if standard newHeads (commit_state is None)
-                                if let Some(state) = commit_state {
-                                    if state != "Proposed" {
-                                        continue;  // monadNewHeads: skip non-Proposed states
-                                    }
+                // ========== ZERO-COPY DESERIALIZATION ==========
+                // Uses typed structs with #[serde(borrow)] to avoid allocations
+                if let Ok(notif) = serde_json::from_str::<WsNotification>(&text) {
+                    if notif.method == "eth_subscription" {
+                        let header = &notif.params.result;
+                        
+                        // For monadNewHeads: only act on "Proposed" state (earliest notification)
+                        // For standard newHeads: commitState won't exist, so process all blocks
+                        if let Some(state) = header.commitState {
+                            if state != "Proposed" {
+                                continue;  // monadNewHeads: skip non-Proposed states
+                            }
+                        }
+                        // If commitState is None, it's standard newHeads - process it!
+                        
+                        // Extract block number (handle hex format) - direct field access, no .get() chains
+                        let block_num = u64::from_str_radix(header.number.trim_start_matches("0x"), 16).unwrap_or(0);
+                        if block_num == 0 {
+                            continue;
+                        }
+                        
+                        // Deduplicate (shouldn't be needed now with Proposed filter, but safety)
+                        if seen_blocks.contains(&block_num) {
+                            continue;
+                        }
+                        seen_blocks.insert(block_num);
+                        
+                        // Prune old entries
+                        if seen_blocks.len() > max_seen_history {
+                            if let Some(&min_block) = seen_blocks.iter().min() {
+                                seen_blocks.remove(&min_block);
+                            }
+                        }
+                        
+                        let receive_time = Instant::now();
+                        
+                        // Extract timestamp - direct field access
+                        let block_timestamp = u64::from_str_radix(header.timestamp.trim_start_matches("0x"), 16).unwrap_or(0);
+                        let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        let latency = now_unix.saturating_sub(block_timestamp);
+                        
+                        println!("\n══════════════════════════════════════════════════════════");
+                        println!("🚀 PROPOSED Block #{} | Latency: {}s | Querying PENDING!", block_num, latency);
+                        
+                        // ========== MULTICALL: BATCH ALL PROFIT CHECKS INTO 1 RPC CALL ==========
+                        // Instead of N separate RPC calls, we make 1 multicall and decode results
+                        use alloy::sol_types::SolCall;
+                        use alloy::eips::BlockNumberOrTag;
+                        
+                        // Filter bots by cooldown first (local check, no RPC needed)
+                        let active_bots: Vec<&ArbBot> = {
+                            let last_bid = last_bid_block.read().await;
+                            bots.iter().filter(|bot| {
+                                if COOLDOWN_BLOCKS == 0 { return true; }
+                                match last_bid.get(&bot.address) {
+                                    Some(&last_block) => block_num > last_block + COOLDOWN_BLOCKS,
+                                    None => true,
                                 }
-                                // If commit_state is None, it's standard newHeads - process it!
-                                
-                                // Extract block number (handle hex format)
-                                let block_num = if let Some(num_str) = result.get("number").and_then(|n| n.as_str()) {
-                                    u64::from_str_radix(num_str.trim_start_matches("0x"), 16).unwrap_or(0)
-                                } else {
-                                    continue;
-                                };
-                                
-                                // Deduplicate (shouldn't be needed now with Proposed filter, but safety)
-                                if seen_blocks.contains(&block_num) {
-                                    continue;
-                                }
-                                seen_blocks.insert(block_num);
-                                
-                                // Prune old entries
-                                if seen_blocks.len() > max_seen_history {
-                                    if let Some(&min_block) = seen_blocks.iter().min() {
-                                        seen_blocks.remove(&min_block);
-                                    }
-                                }
-                                
-                                let receive_time = Instant::now();
-                                let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                                
-                                // Extract timestamp
-                                let block_timestamp = if let Some(ts_str) = result.get("timestamp").and_then(|t| t.as_str()) {
-                                    u64::from_str_radix(ts_str.trim_start_matches("0x"), 16).unwrap_or(0)
-                                } else {
-                                    0
-                                };
-                                
-                                let latency = now_unix.saturating_sub(block_timestamp);
-                                
-                                println!("\n══════════════════════════════════════════════════════════");
-                                println!("🚀 PROPOSED Block #{} | Latency: {}s | Querying PENDING!", block_num, latency);
-                                
-                                // Process bots
-                                for bot in &bots {
-                                    // Check cooldown - skip if bot bid recently
-                                    if COOLDOWN_BLOCKS > 0 {
-                                        let last_bid = last_bid_block.read().await;
-                                        if let Some(&last_block) = last_bid.get(&bot.address) {
-                                            if block_num <= last_block + COOLDOWN_BLOCKS {
-                                                // Still in cooldown, skip this bot
-                                                continue;
-                                            }
-                                        }
+                            }).collect()
+                        };
+                        
+                        if active_bots.is_empty() {
+                            println!("⏸️ All bots in cooldown");
+                            continue;
+                        }
+                        
+                        // Pre-encode keeperProfit() calldata once (reused for all bots)
+                        let keeper_profit_call = Arbitrage::keeperProfitCall {};
+                        let calldata = alloy::primitives::Bytes::from(keeper_profit_call.abi_encode());
+                        
+                        // Build Call3 array for all active bots
+                        let calls: Vec<Multicall3::Call3> = active_bots.iter()
+                            .map(|bot| Multicall3::Call3 {
+                                target: bot.address,
+                                allowFailure: true,  // Don't revert entire call if one bot fails
+                                callData: calldata.clone(),
+                            })
+                            .collect();
+                        
+                        let check_start = Instant::now();
+                        
+                        // Single RPC call for all bots!
+                        let multicall_addr = Address::from_str(MULTICALL3_ADDRESS).unwrap();
+                        let multicall = Multicall3::new(multicall_addr, (*http_provider).clone());
+                        
+                        let multicall_result = multicall.aggregate3(calls.clone())
+                            .block(BlockNumberOrTag::Pending.into())
+                            .call()
+                            .await;
+                        
+                        let check_elapsed = check_start.elapsed();
+                        println!("📦 Multicall ({} bots) in {:?}", active_bots.len(), check_elapsed);
+                        
+                        match multicall_result {
+                            Ok(results) => {
+                                // Decode and process results for each bot
+                                for (i, result) in results.iter().enumerate() {
+                                    if !result.success {
+                                        continue;
                                     }
                                     
-                                    // IMMEDIATELY mark this bot as "bidding" on this block
-                                    // This prevents race condition where multiple blocks spawn tasks
-                                    // before the first task finishes and updates cooldown
+                                    // Decode keeperProfit return data: (bool profitable, uint256 expectedProfit)
+                                    let decoded = match Arbitrage::keeperProfitCall::abi_decode_returns(&result.returnData) {
+                                        Ok(d) => d,
+                                        Err(_) => continue,
+                                    };
+                                    
+                                    if !decoded.profitable {
+                                        continue;
+                                    }
+                                    
+                                    let bot = active_bots[i];
+                                    let expected_profit = decoded.expectedProfit;
+                                    
+                                    // Mark cooldown immediately
                                     if COOLDOWN_BLOCKS > 0 {
                                         let mut last_bid = last_bid_block.write().await;
                                         last_bid.insert(bot.address, block_num);
                                     }
                                     
-                                    let contract = Arbitrage::new(bot.address, (*http_provider).clone());
+                                    // Spawn tx signing/broadcast task
                                     let bot_name = bot.name.clone();
-                                    let tx_template = bot.tx_template.clone();  // Pre-computed tx template
+                                    let tx_template = bot.tx_template.clone();
                                     let receive_time_clone = receive_time;
                                     let block_num_clone = block_num;
                                     let broadcast_providers_clone = broadcast_providers.clone();
                                     let nonce_clone = shared_nonce.clone();
                                     let wallet_clone = wallet_arc.clone();
                                     let receipt_tx_clone = receipt_tx.clone();
+                                    let log_tx_clone = log_tx.clone();
+                                    let check_elapsed_clone = check_elapsed;
                                     
                                     tokio::spawn(async move {
-                                        let check_start = Instant::now();
+                                        let _ = log_tx_clone.try_send(format!(
+                                            "[{}] 🎯 PROFITABLE! Block {} Profit: {} (multicall: {:?})", 
+                                            bot_name, block_num_clone, format_wei(expected_profit), check_elapsed_clone));
                                         
-                                        // Use optimized keeperProfit() - returns only (bool, uint256)
-                                        // 10-tick depth vs 50, minimal return payload
-                                        use alloy::eips::BlockNumberOrTag;
-                                        let result = contract.keeperProfit()
-                                            .block(BlockNumberOrTag::Pending.into())
-                                            .call()
-                                            .await;
-                                        let check_elapsed = check_start.elapsed();
+                                        let exec_start = Instant::now();
                                         
-                                        match result {
-                                            Ok(profit_data) => {
-                                                if profit_data.profitable {
-                                                    println!("[{}] 🎯 PROFITABLE! Block {} Profit: {} (check: {:?})", 
-                                                        bot_name, block_num_clone, format_wei(profit_data.expectedProfit), check_elapsed);
-                                                    
-                                                    let exec_start = Instant::now();
-                                                    
-                                                    // Use pre-computed template - only fill in nonce + priority fee
-                                                    use alloy::eips::eip2718::Encodable2718;
-                                                    use alloy::network::TransactionBuilder;
-                                                    
-                                                    // Atomically get and increment nonce
-                                                    let current_nonce = nonce_clone.fetch_add(1, Ordering::SeqCst);
-                                                    
-                                                    // Calculate dynamic priority fee based on profit
-                                                    let profit_u128: u128 = profit_data.expectedProfit.try_into().unwrap_or(0);
-                                                    let priority_fee = calculate_priority_fee(profit_u128);
-                                                    let priority_gwei = priority_fee / 1_000_000_000;
-                                                    
-                                                    // DEBUG: Show priority calculation
-                                                    println!("[{}] 💰 Raw profit: {} | Priority: {} gwei", 
-                                                        bot_name, profit_u128, priority_gwei);
-                                                    
-                                                    // Build tx from template - avoids repeated abi_encode() in hot path!
-                                                    let tx_request = tx_template.build_with(current_nonce, priority_fee);
-                                                    
-                                                    let tx_envelope = match tx_request.build(&*wallet_clone).await {
-                                                        Ok(e) => e,
-                                                        Err(err) => {
-                                                            println!("[{}] ⚠️ Failed to sign tx: {:?}", bot_name, err);
-                                                            return;
-                                                        }
-                                                    };
-                                                    
-                                                    // Pre-allocate vector for raw tx (avoids reallocation)
-                                                    let mut raw_tx_vec = Vec::with_capacity(512);
-                                                    tx_envelope.encode_2718(&mut raw_tx_vec);
-                                                    let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
-                                                    let tx_hash = *tx_envelope.tx_hash();
-                                                    
-                                                    println!("[{}] ⚡ Signed tx nonce={} priority={}gwei (sign: {:?})", 
-                                                        bot_name, current_nonce, priority_gwei, exec_start.elapsed());
-                                                    
-                                                    // Fire-and-forget broadcasts - DO NOT BLOCK the critical path
-                                                    // Logs will still print from background task for benchmarking
-                                                    let bot_name_log = bot_name.clone();
-                                                    let bot_name_receipt = bot_name.clone(); // For receipt request
-                                                    let provider_count = broadcast_providers_clone.len();
-                                                    tokio::spawn(async move {
-                                                        let broadcast_futures: Vec<_> = broadcast_providers_clone.iter().enumerate()
-                                                            .map(|(i, provider)| {
-                                                                let p = provider.clone();
-                                                                let tx = raw_tx.clone();
-                                                                let name = bot_name.clone();
-                                                                let prio = priority_gwei;
-                                                                async move {
-                                                                    match p.send_raw_transaction(&tx).await {
-                                                                        Ok(_) => println!("[{}] 📡 #{} ✓ ({}gwei)", name, i + 1, prio),
-                                                                        Err(_) => {}
-                                                                    }
-                                                                }
-                                                            })
-                                                            .collect();
-                                                        
-                                                        futures::future::join_all(broadcast_futures).await;
-                                                        println!("[{}] 📡 All {} broadcasts complete", bot_name, provider_count);
-                                                    });
-                                                    
-                                                    let total_exec = exec_start.elapsed();
-                                                    println!("[{}] 🚀 Tx dispatched to background | Sign+Dispatch: {:?}", 
-                                                        bot_name_log, total_exec);
-                                                    
-                                                    // Cooldown already recorded before spawning task
-                                                    
-                                                    // Send receipt request to background worker (OFF critical path!)
-                                                    let _ = receipt_tx_clone.send(ReceiptRequest {
-                                                        tx_hash,
-                                                        bot_name: bot_name_receipt,
-                                                        block_detected: block_num_clone,
-                                                        expected_profit: format_wei(profit_data.expectedProfit),
-                                                        check_time: format!("{:?}", check_elapsed),
-                                                        exec_time: format!("{:?}", total_exec),
-                                                        receive_time: receive_time_clone,
-                                                    }).await;
-                                                }
+                                        use alloy::eips::eip2718::Encodable2718;
+                                        use alloy::network::TransactionBuilder;
+                                        
+                                        let current_nonce = nonce_clone.fetch_add(1, Ordering::SeqCst);
+                                        let profit_u128: u128 = expected_profit.try_into().unwrap_or(0);
+                                        let priority_fee = calculate_priority_fee(profit_u128);
+                                        let priority_gwei = priority_fee / 1_000_000_000;
+                                        
+                                        let tx_request = tx_template.build_with(current_nonce, priority_fee);
+                                        
+                                        let tx_envelope = match tx_request.build(&*wallet_clone).await {
+                                            Ok(e) => e,
+                                            Err(err) => {
+                                                let _ = log_tx_clone.try_send(format!(
+                                                    "[{}] ⚠️ Failed to sign tx: {:?}", bot_name, err));
+                                                return;
                                             }
-                                            Err(_e) => {
-                                                // Pending query failed - spawn async retry (non-blocking!)
-                                                let contract_retry = contract.clone();
-                                                let bot_name_retry = bot_name.clone();
-                                                let tx_template_retry = tx_template.clone();  // Use template for retry too
-                                                let broadcast_providers_retry = broadcast_providers_clone.clone();
-                                                let nonce_retry = nonce_clone.clone();
-                                                let wallet_retry = wallet_clone.clone();
-                                                
-                                                tokio::spawn(async move {
-                                                    // Wait briefly and retry pending
-                                                    tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
-                                                    
-                                                    let retry_result = contract_retry.calculateProfit()
-                                                        .block(BlockNumberOrTag::Pending.into())
-                                                        .call()
-                                                        .await;
-                                                    
-                                                    if let Ok(profit_data) = retry_result {
-                                                        if profit_data.profitable {
-                                                            println!("[{}] 🎯 PENDING (retry) block {} Profit: {}", 
-                                                                bot_name_retry, block_num_clone, format_wei(profit_data.expectedProfit));
-                                                            
-                                                            // Use template for retry - consistent with main path
-                                                            use alloy::eips::eip2718::Encodable2718;
-                                                            use alloy::network::TransactionBuilder;
-                                                            
-                                                            let current_nonce = nonce_retry.fetch_add(1, Ordering::SeqCst);
-                                                            let profit_u128: u128 = profit_data.expectedProfit.try_into().unwrap_or(0);
-                                                            let priority_fee = calculate_priority_fee(profit_u128);
-                                                            let priority_gwei = priority_fee / 1_000_000_000;
-                                                            
-                                                            // Build from template
-                                                            let tx_request = tx_template_retry.build_with(current_nonce, priority_fee);
-                                                            
-                                                            if let Ok(tx_envelope) = tx_request.build(&*wallet_retry).await {
-                                                                let mut raw_tx_vec = Vec::with_capacity(512);
-                                                                tx_envelope.encode_2718(&mut raw_tx_vec);
-                                                                let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
-                                                                
-                                                                // Parallel broadcasts using pre-created providers
-                                                                let broadcast_futures: Vec<_> = broadcast_providers_retry.iter().enumerate()
-                                                                    .map(|(i, provider)| {
-                                                                        let p = provider.clone();
-                                                                        let tx = raw_tx.clone();
-                                                                        let name = bot_name_retry.clone();
-                                                                        async move {
-                                                                            if let Ok(_) = p.send_raw_transaction(&tx).await {
-                                                                                println!("[{}] 📡 #{} ✓ (retry, {}gwei)", name, i + 1, priority_gwei);
-                                                                            }
-                                                                        }
-                                                                    })
-                                                                    .collect();
-                                                                
-                                                                futures::future::join_all(broadcast_futures).await;
-                                                            }
-                                                        }
-                                                    }
-                                                    // Silent fail on retry
-                                                });
-                                            }
+                                        };
+                                        
+                                        let mut raw_tx_vec = Vec::with_capacity(512);
+                                        tx_envelope.encode_2718(&mut raw_tx_vec);
+                                        let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
+                                        let tx_hash = *tx_envelope.tx_hash();
+                                        
+                                        let total_exec = exec_start.elapsed();
+                                        let _ = log_tx_clone.try_send(format!(
+                                            "[{}] ⚡ Signed tx nonce={} priority={}gwei (sign: {:?})", 
+                                            bot_name, current_nonce, priority_gwei, total_exec));
+                                        
+                                        // Fire-and-forget broadcasts - spawn each individually, don't wait
+                                        let bot_name_receipt = bot_name.clone();
+                                        for provider in broadcast_providers_clone.iter() {
+                                            let p = provider.clone();
+                                            let tx = raw_tx.clone();
+                                            tokio::spawn(async move {
+                                                let _ = p.send_raw_transaction(&tx).await;
+                                            });
                                         }
+                                        
+                                        // Non-blocking receipt request
+                                        let _ = receipt_tx_clone.try_send(ReceiptRequest {
+                                            tx_hash,
+                                            bot_name: bot_name_receipt,
+                                            block_detected: block_num_clone,
+                                            expected_profit: format_wei(expected_profit),
+                                            check_time: format!("{:?}", check_elapsed_clone),
+                                            exec_time: format!("{:?}", total_exec),
+                                            receive_time: receive_time_clone,
+                                        });
                                     });
                                 }
-                                
-                                println!("⚡ Spawned {} bot checks in {:?}", bots.len(), receive_time.elapsed());
+                            }
+                            Err(e) => {
+                                println!("⚠️ Multicall failed: {:?}", e);
                             }
                         }
+                        
+                        println!("⚡ Processed {} bots via multicall in {:?}", active_bots.len(), receive_time.elapsed());
                     }
                 }
             }
