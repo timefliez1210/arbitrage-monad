@@ -365,8 +365,8 @@ contract ArbitrageAUSD is IUnlockCallback {
             kuruVolWei = getAggregatedBidSize(50, uniPrice1e18 + fee);
 
             // Limit Price (SqrtX96)
-            // Buffer: 10bps (0.1%)
-            uint256 safeBid = (bestBid * 9990) / 10000;
+            // Buffer: 20bps (0.2%)
+            uint256 safeBid = (bestBid * 9980) / 10000;
             uint256 root = FixedPointMathLib.sqrt(safeBid);
             sqrtLimit = uint160(
                 FullMath.mulDiv(root, 1 << 96, SQRT_PRICE_SCALE)

@@ -671,12 +671,13 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                 let _ = ws_stream.send(Message::Pong(data)).await;
             }
             Err(e) => {
-                println!("⚠️ WebSocket error: {:?}", e);
-                break;
+                // Return error to trigger reconnection in main loop
+                return Err(anyhow::anyhow!("WebSocket error: {:?}", e));
             }
             _ => {}
         }
     }
     
-    Ok(())
+    // If we reach here, the WebSocket stream ended (server closed connection)
+    Err(anyhow::anyhow!("WebSocket stream ended unexpectedly"))
 }

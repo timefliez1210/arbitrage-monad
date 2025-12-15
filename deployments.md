@@ -89,15 +89,21 @@ WBTC address 0x0555E30da8f98308EdB960aa94C0Db47230d2B9c
 - Typical Δ Blocks: 2, occasional 3-4 on slow RPC responses
 - See `transactions_monad_before_optimization.md` for benchmark data
 
-### keeperProfit() Optimization (2024-12-15) - ACTIVE
+### keeperProfit() Optimization (2024-12-15) - SUPERSEDED
 - **ArbitrageAUSD**: `0x1ac3741941f8a4dfe99274d78826998b4b02e671`
 - **ArbitrageUSDC**: `0xc2e5ec965af80916eacfc28cae63e3bd85d195e1`
 - Feature: `keeperProfit()` view function (10-tick depth vs 50)
 - Feature: Async broadcasts (tokio::spawn for fire-and-forget)
 
-### Price-Only v5 (2024-12-15) - NOT WORKING
-- **ArbitrageAUSD**: `0xb2c9b8877e68bfeb9eb48e63b3f2dccf2d566d22`
-- **ArbitrageUSDC**: `0x1b89f75519ce32971a83cf0b0ed5b9bace2e1b8b`
-- Feature: `keeperProfit()` with NO liquidity scan - prices only
-- Trade-off: May fire on low-liquidity spreads (execute() handles safely)
-- Expected Check Time: ~30-50ms (vs ~130ms with liquidity)
+### Precision Buffer Fix v6 (2024-12-15) - SUPERSEDED
+- **ArbitrageAUSD**: `0xa75D4879cE4E3C06eDcbfe81C39fb8D531e7ffdA`
+- **ArbitrageUSDC**: `0xf621E89D09D7c65b041B1557534B25BC5B8d9cd8`
+- Fix: Price limit margin 0.07% → 0.1%
+- Fix: Quantity buffer 0.3% → 0.4%
+- Still reverted on partial fills due to sqrtPriceLimit
+
+### Price Limit Fix v7 (2024-12-15) - ACTIVE
+- **ArbitrageAUSD**: `0x602410f69c9ec48cfcb3c5030d46a93f0180bc6b`
+- **ArbitrageUSDC**: `0xcba9708114edbc3eba7e85c941cdaec75ace63e2`
+- Fix: Price limit margin 0.1% → 0.2% (9980/10000)
+- Addresses partial fill precision reverts

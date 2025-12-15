@@ -368,8 +368,8 @@ contract ArbitrageUSDC is IUnlockCallback {
             kuruVolWei = getAggregatedBidSize(50, uniPrice1e18 + fee);
 
             // Limit Price (SqrtX96)
-            // Buffer: 10bps (0.1%)
-            uint256 safeBid = (bestBid * 9990) / 10000;
+            // Buffer: 20bps (0.2%)
+            uint256 safeBid = (bestBid * 9980) / 10000;
             uint256 root = FixedPointMathLib.sqrt(safeBid);
             sqrtLimit = uint160(
                 FullMath.mulDiv(root, 1 << 96, SQRT_PRICE_SCALE)
@@ -637,280 +637,280 @@ contract ArbitrageUSDC is IUnlockCallback {
         return (totalSizeWei, totalCostUSDC);
     }
 
-    function getLiquidityInRange(
-        Currency currency,
-        int24 startTick,
-        int24 endTick
-    )
-        public
-        view
-        returns (TickLiquidity[] memory initializedTicks, uint256 wordsScanned)
-    {
-        if (startTick >= endTick) revert("Invalid Range");
+    // function getLiquidityInRange(
+    //     Currency currency,
+    //     int24 startTick,
+    //     int24 endTick
+    // )
+    //     public
+    //     view
+    //     returns (TickLiquidity[] memory initializedTicks, uint256 wordsScanned)
+    // {
+    //     if (startTick >= endTick) revert("Invalid Range");
 
-        PoolKey memory key = getPoolKey(currency);
-        PoolId id = key.toId();
-        int24 tickSpacing = key.tickSpacing;
+    //     PoolKey memory key = getPoolKey(currency);
+    //     PoolId id = key.toId();
+    //     int24 tickSpacing = key.tickSpacing;
 
-        // Estimate max size to avoid OOG in view call if range is huge
-        // For simplicity in this efficiency-focused snippet, we use a dynamic array
-        TickLiquidity[] memory tempTicks = new TickLiquidity[](500);
-        uint256 count = 0;
+    //     // Estimate max size to avoid OOG in view call if range is huge
+    //     // For simplicity in this efficiency-focused snippet, we use a dynamic array
+    //     TickLiquidity[] memory tempTicks = new TickLiquidity[](500);
+    //     uint256 count = 0;
 
-        // Align startTick to tickSpacing
-        // We need to find the word containing startTick
-        int24 compressed = startTick / tickSpacing;
-        if (startTick < 0 && startTick % tickSpacing != 0) compressed--; // Round down
+    //     // Align startTick to tickSpacing
+    //     // We need to find the word containing startTick
+    //     int24 compressed = startTick / tickSpacing;
+    //     if (startTick < 0 && startTick % tickSpacing != 0) compressed--; // Round down
 
-        // Start from the word containing the compressed tick
-        int16 currentWordPos = int16(compressed >> 8);
-        int16 endWordPos = int16((endTick / tickSpacing) >> 8);
+    //     // Start from the word containing the compressed tick
+    //     int16 currentWordPos = int16(compressed >> 8);
+    //     int16 endWordPos = int16((endTick / tickSpacing) >> 8);
 
-        // We assume 1 word per iteration as a rough metric for gas
-        wordsScanned = uint256(int256(endWordPos) - int256(currentWordPos)) + 1;
+    //     // We assume 1 word per iteration as a rough metric for gas
+    //     wordsScanned = uint256(int256(endWordPos) - int256(currentWordPos)) + 1;
 
-        for (int16 wordPos = currentWordPos; wordPos <= endWordPos; wordPos++) {
-            uint256 mask = PM.getTickBitmap(id, wordPos);
+    //     for (int16 wordPos = currentWordPos; wordPos <= endWordPos; wordPos++) {
+    //         uint256 mask = PM.getTickBitmap(id, wordPos);
 
-            if (mask != 0) {
-                // Iterate bits
-                bool stop;
-                (count, stop) = _scanWord(
-                    id,
-                    wordPos,
-                    tickSpacing,
-                    startTick,
-                    endTick,
-                    tempTicks,
-                    count,
-                    mask
-                );
-                if (stop) break;
-            }
-            if (count >= 500) break;
-        }
+    //         if (mask != 0) {
+    //             // Iterate bits
+    //             bool stop;
+    //             (count, stop) = _scanWord(
+    //                 id,
+    //                 wordPos,
+    //                 tickSpacing,
+    //                 startTick,
+    //                 endTick,
+    //                 tempTicks,
+    //                 count,
+    //                 mask
+    //             );
+    //             if (stop) break;
+    //         }
+    //         if (count >= 500) break;
+    //     }
 
-        // Resize array
-        initializedTicks = new TickLiquidity[](count);
-        for (uint i = 0; i < count; i++) initializedTicks[i] = tempTicks[i];
-    }
+    //     // Resize array
+    //     initializedTicks = new TickLiquidity[](count);
+    //     for (uint i = 0; i < count; i++) initializedTicks[i] = tempTicks[i];
+    // }
 
-    function calculateMaxCapacity(
-        Currency currency, // New parameter
-        uint160 sqrtPriceCurrent,
-        uint160 targetSqrtPrice,
-        int24 currentTick,
-        uint128 currentLiquidity
-    ) internal view returns (uint256 maxAmount, uint256 wordsScanned) {
-        bool zeroForOne = targetSqrtPrice < sqrtPriceCurrent;
+    // function calculateMaxCapacity(
+    //     Currency currency, // New parameter
+    //     uint160 sqrtPriceCurrent,
+    //     uint160 targetSqrtPrice,
+    //     int24 currentTick,
+    //     uint128 currentLiquidity
+    // ) internal view returns (uint256 maxAmount, uint256 wordsScanned) {
+    //     bool zeroForOne = targetSqrtPrice < sqrtPriceCurrent;
 
-        // Define range for getLiquidityInRange
-        int24 tT = TickMath.getTickAtSqrtPrice(targetSqrtPrice);
-        TickLiquidity[] memory ticks;
-        if (zeroForOne) {
-            if (tT >= currentTick) return (0, 0);
-            (ticks, wordsScanned) = getLiquidityInRange(
-                currency,
-                tT,
-                currentTick
-            );
-        } else {
-            if (currentTick >= tT) return (0, 0);
-            (ticks, wordsScanned) = getLiquidityInRange(
-                currency,
-                currentTick,
-                tT
-            );
-        }
+    //     // Define range for getLiquidityInRange
+    //     int24 tT = TickMath.getTickAtSqrtPrice(targetSqrtPrice);
+    //     TickLiquidity[] memory ticks;
+    //     if (zeroForOne) {
+    //         if (tT >= currentTick) return (0, 0);
+    //         (ticks, wordsScanned) = getLiquidityInRange(
+    //             currency,
+    //             tT,
+    //             currentTick
+    //         );
+    //     } else {
+    //         if (currentTick >= tT) return (0, 0);
+    //         (ticks, wordsScanned) = getLiquidityInRange(
+    //             currency,
+    //             currentTick,
+    //             tT
+    //         );
+    //     }
 
-        // State variables for iteration
-        uint160 sqrtPriceC = sqrtPriceCurrent;
-        uint128 liquidity = currentLiquidity;
+    //     // State variables for iteration
+    //     uint160 sqrtPriceC = sqrtPriceCurrent;
+    //     uint128 liquidity = currentLiquidity;
 
-        if (zeroForOne) {
-            // Price Decreasing (Token0 out, Token1 in). Iterate ticks from high to low.
-            int256 firstTickIdx = -1;
-            for (uint i = ticks.length; i > 0; i--) {
-                if (ticks[i - 1].tick <= currentTick) {
-                    firstTickIdx = int256(i - 1);
-                    break;
-                }
-            }
+    //     if (zeroForOne) {
+    //         // Price Decreasing (Token0 out, Token1 in). Iterate ticks from high to low.
+    //         int256 firstTickIdx = -1;
+    //         for (uint i = ticks.length; i > 0; i--) {
+    //             if (ticks[i - 1].tick <= currentTick) {
+    //                 firstTickIdx = int256(i - 1);
+    //                 break;
+    //             }
+    //         }
 
-            if (firstTickIdx == -1) {
-                // No ticks
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        targetSqrtPrice,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                return (maxAmount, wordsScanned);
-            }
+    //         if (firstTickIdx == -1) {
+    //             // No ticks
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     targetSqrtPrice,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             return (maxAmount, wordsScanned);
+    //         }
 
-            uint160 sqrtPriceLimitForFirstSegment = TickMath.getSqrtPriceAtTick(
-                ticks[uint(firstTickIdx)].tick
-            );
-            if (sqrtPriceLimitForFirstSegment < targetSqrtPrice)
-                sqrtPriceLimitForFirstSegment = targetSqrtPrice;
+    //         uint160 sqrtPriceLimitForFirstSegment = TickMath.getSqrtPriceAtTick(
+    //             ticks[uint(firstTickIdx)].tick
+    //         );
+    //         if (sqrtPriceLimitForFirstSegment < targetSqrtPrice)
+    //             sqrtPriceLimitForFirstSegment = targetSqrtPrice;
 
-            if (sqrtPriceC > sqrtPriceLimitForFirstSegment) {
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        sqrtPriceLimitForFirstSegment,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                sqrtPriceC = nextSqrtP;
-            }
+    //         if (sqrtPriceC > sqrtPriceLimitForFirstSegment) {
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     sqrtPriceLimitForFirstSegment,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             sqrtPriceC = nextSqrtP;
+    //         }
 
-            for (int256 i = firstTickIdx; i >= 0; i--) {
-                TickLiquidity memory t = ticks[uint(i)];
-                if (sqrtPriceC <= targetSqrtPrice) break;
-                if (sqrtPriceC <= TickMath.getSqrtPriceAtTick(t.tick)) {
-                    liquidity = uint128(int128(liquidity) - t.liquidityNet);
-                    continue;
-                }
-                uint160 sqrtPriceNextTick = TickMath.getSqrtPriceAtTick(t.tick);
-                uint160 sqrtPriceLimit = sqrtPriceNextTick;
-                if (sqrtPriceLimit < targetSqrtPrice)
-                    sqrtPriceLimit = targetSqrtPrice;
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        sqrtPriceLimit,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                sqrtPriceC = nextSqrtP;
-                liquidity = uint128(int128(liquidity) - t.liquidityNet);
-            }
+    //         for (int256 i = firstTickIdx; i >= 0; i--) {
+    //             TickLiquidity memory t = ticks[uint(i)];
+    //             if (sqrtPriceC <= targetSqrtPrice) break;
+    //             if (sqrtPriceC <= TickMath.getSqrtPriceAtTick(t.tick)) {
+    //                 liquidity = uint128(int128(liquidity) - t.liquidityNet);
+    //                 continue;
+    //             }
+    //             uint160 sqrtPriceNextTick = TickMath.getSqrtPriceAtTick(t.tick);
+    //             uint160 sqrtPriceLimit = sqrtPriceNextTick;
+    //             if (sqrtPriceLimit < targetSqrtPrice)
+    //                 sqrtPriceLimit = targetSqrtPrice;
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     sqrtPriceLimit,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             sqrtPriceC = nextSqrtP;
+    //             liquidity = uint128(int128(liquidity) - t.liquidityNet);
+    //         }
 
-            if (sqrtPriceC > targetSqrtPrice) {
-                (, , uint256 amountOut, ) = SwapMath.computeSwapStep(
-                    sqrtPriceC,
-                    targetSqrtPrice,
-                    liquidity,
-                    type(int256).max,
-                    500
-                );
-                maxAmount += amountOut;
-            }
-        } else {
-            // Price Increasing. Iterate ticks from low to high.
-            int256 firstTickIdx = -1;
-            for (uint i = 0; i < ticks.length; i++) {
-                if (ticks[i].tick >= currentTick) {
-                    firstTickIdx = int256(i);
-                    break;
-                }
-            }
+    //         if (sqrtPriceC > targetSqrtPrice) {
+    //             (, , uint256 amountOut, ) = SwapMath.computeSwapStep(
+    //                 sqrtPriceC,
+    //                 targetSqrtPrice,
+    //                 liquidity,
+    //                 type(int256).max,
+    //                 500
+    //             );
+    //             maxAmount += amountOut;
+    //         }
+    //     } else {
+    //         // Price Increasing. Iterate ticks from low to high.
+    //         int256 firstTickIdx = -1;
+    //         for (uint i = 0; i < ticks.length; i++) {
+    //             if (ticks[i].tick >= currentTick) {
+    //                 firstTickIdx = int256(i);
+    //                 break;
+    //             }
+    //         }
 
-            if (firstTickIdx == -1) {
-                // No ticks
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        targetSqrtPrice,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                return (maxAmount, wordsScanned);
-            }
+    //         if (firstTickIdx == -1) {
+    //             // No ticks
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     targetSqrtPrice,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             return (maxAmount, wordsScanned);
+    //         }
 
-            uint160 sqrtPriceLimitForFirstSegment = TickMath.getSqrtPriceAtTick(
-                ticks[uint(firstTickIdx)].tick
-            );
-            if (sqrtPriceLimitForFirstSegment > targetSqrtPrice)
-                sqrtPriceLimitForFirstSegment = targetSqrtPrice;
+    //         uint160 sqrtPriceLimitForFirstSegment = TickMath.getSqrtPriceAtTick(
+    //             ticks[uint(firstTickIdx)].tick
+    //         );
+    //         if (sqrtPriceLimitForFirstSegment > targetSqrtPrice)
+    //             sqrtPriceLimitForFirstSegment = targetSqrtPrice;
 
-            if (sqrtPriceC < sqrtPriceLimitForFirstSegment) {
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        sqrtPriceLimitForFirstSegment,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                sqrtPriceC = nextSqrtP;
-            }
+    //         if (sqrtPriceC < sqrtPriceLimitForFirstSegment) {
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     sqrtPriceLimitForFirstSegment,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             sqrtPriceC = nextSqrtP;
+    //         }
 
-            for (int256 i = firstTickIdx; i < int256(ticks.length); i++) {
-                TickLiquidity memory t = ticks[uint(i)];
-                if (sqrtPriceC >= targetSqrtPrice) break;
-                if (sqrtPriceC >= TickMath.getSqrtPriceAtTick(t.tick)) {
-                    liquidity = uint128(int128(liquidity) + t.liquidityNet);
-                    continue;
-                }
-                uint160 sqrtPriceNextTick = TickMath.getSqrtPriceAtTick(t.tick);
-                uint160 sqrtPriceLimit = sqrtPriceNextTick;
-                if (sqrtPriceLimit > targetSqrtPrice)
-                    sqrtPriceLimit = targetSqrtPrice;
-                (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
-                    .computeSwapStep(
-                        sqrtPriceC,
-                        sqrtPriceLimit,
-                        liquidity,
-                        type(int256).max,
-                        500
-                    );
-                maxAmount += amountOut;
-                sqrtPriceC = nextSqrtP;
-                liquidity = uint128(int128(liquidity) + t.liquidityNet);
-            }
+    //         for (int256 i = firstTickIdx; i < int256(ticks.length); i++) {
+    //             TickLiquidity memory t = ticks[uint(i)];
+    //             if (sqrtPriceC >= targetSqrtPrice) break;
+    //             if (sqrtPriceC >= TickMath.getSqrtPriceAtTick(t.tick)) {
+    //                 liquidity = uint128(int128(liquidity) + t.liquidityNet);
+    //                 continue;
+    //             }
+    //             uint160 sqrtPriceNextTick = TickMath.getSqrtPriceAtTick(t.tick);
+    //             uint160 sqrtPriceLimit = sqrtPriceNextTick;
+    //             if (sqrtPriceLimit > targetSqrtPrice)
+    //                 sqrtPriceLimit = targetSqrtPrice;
+    //             (uint160 nextSqrtP, , uint256 amountOut, ) = SwapMath
+    //                 .computeSwapStep(
+    //                     sqrtPriceC,
+    //                     sqrtPriceLimit,
+    //                     liquidity,
+    //                     type(int256).max,
+    //                     500
+    //                 );
+    //             maxAmount += amountOut;
+    //             sqrtPriceC = nextSqrtP;
+    //             liquidity = uint128(int128(liquidity) + t.liquidityNet);
+    //         }
 
-            if (sqrtPriceC < targetSqrtPrice) {
-                (, , uint256 amountOut, ) = SwapMath.computeSwapStep(
-                    sqrtPriceC,
-                    targetSqrtPrice,
-                    liquidity,
-                    type(int256).max,
-                    500
-                );
-                maxAmount += amountOut;
-            }
-        }
-    }
+    //         if (sqrtPriceC < targetSqrtPrice) {
+    //             (, , uint256 amountOut, ) = SwapMath.computeSwapStep(
+    //                 sqrtPriceC,
+    //                 targetSqrtPrice,
+    //                 liquidity,
+    //                 type(int256).max,
+    //                 500
+    //             );
+    //             maxAmount += amountOut;
+    //         }
+    //     }
+    // }
 
-    function _scanWord(
-        PoolId id,
-        int16 wordPos,
-        int24 tickSpacing,
-        int24 startTick,
-        int24 endTick,
-        TickLiquidity[] memory tempTicks,
-        uint256 count,
-        uint256 mask
-    ) private view returns (uint256, bool) {
-        for (uint8 i = 0; i < 255; i++) {
-            if ((mask & (1 << i)) != 0) {
-                int24 compressedTick = (int24(wordPos) << 8) + int24(uint24(i));
-                int24 actualTick = compressedTick * tickSpacing;
+    // function _scanWord(
+    //     PoolId id,
+    //     int16 wordPos,
+    //     int24 tickSpacing,
+    //     int24 startTick,
+    //     int24 endTick,
+    //     TickLiquidity[] memory tempTicks,
+    //     uint256 count,
+    //     uint256 mask
+    // ) private view returns (uint256, bool) {
+    //     for (uint8 i = 0; i < 255; i++) {
+    //         if ((mask & (1 << i)) != 0) {
+    //             int24 compressedTick = (int24(wordPos) << 8) + int24(uint24(i));
+    //             int24 actualTick = compressedTick * tickSpacing;
 
-                if (actualTick > endTick) return (count, true);
-                if (actualTick >= startTick) {
-                    (
-                        tempTicks[count].liquidityGross,
-                        tempTicks[count].liquidityNet
-                    ) = PM.getTickLiquidity(id, actualTick);
-                    tempTicks[count].tick = actualTick;
-                    count++;
-                    if (count >= 500) return (count, true);
-                }
-            }
-        }
-        return (count, false);
-    }
+    //             if (actualTick > endTick) return (count, true);
+    //             if (actualTick >= startTick) {
+    //                 (
+    //                     tempTicks[count].liquidityGross,
+    //                     tempTicks[count].liquidityNet
+    //                 ) = PM.getTickLiquidity(id, actualTick);
+    //                 tempTicks[count].tick = actualTick;
+    //                 count++;
+    //                 if (count >= 500) return (count, true);
+    //             }
+    //         }
+    //     }
+    //     return (count, false);
+    // }
 }
