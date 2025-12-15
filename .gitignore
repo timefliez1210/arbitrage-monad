@@ -1,0 +1,37 @@
+# Compiler files (Foundry)
+cache/
+out/
+
+# Ignores development broadcast logs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Docs
+docs/
+
+# Environment files (NEVER commit these!)
+.env
+.env.*
+*.env
+**/.env
+
+# Rust build artifacts (arbitrage_monad)
+**/target/
+Cargo.lock
+
+# Node.js
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
