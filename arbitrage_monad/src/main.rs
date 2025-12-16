@@ -621,6 +621,7 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                         let receipt_tx_clone = receipt_tx.clone();
                         let log_tx_clone = log_tx.clone();
                         let check_elapsed_clone = check_elapsed;
+                        let tx_outbox_clone = tx_outbox.clone();  // For hot WS broadcast
                         
                         tokio::spawn(async move {
                             let _ = log_tx_clone.try_send(format!(
@@ -650,7 +651,7 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                             
                             let mut raw_tx_vec = Vec::with_capacity(512);
                             tx_envelope.encode_2718(&mut raw_tx_vec);
-                            let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
+                            let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec.clone());
                             let tx_hash = *tx_envelope.tx_hash();
                             
                             let total_exec = exec_start.elapsed();
@@ -658,7 +659,22 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                                 "[{}] ⚡ Signed tx nonce={} priority={}gwei (sign: {:?})", 
                                 bot_name, current_nonce, priority_gwei, total_exec));
                             
-                            // Parallel broadcasts
+                            // ═══════════════════════════════════════════════════════════
+                            // 1. FIRE VIA WEBSOCKET (The "Golden Bullet" - ~0.1ms)
+                            // ═══════════════════════════════════════════════════════════
+                            let tx_hex = format!("0x{}", hex::encode(&raw_tx_vec));
+                            let ws_broadcast = format!(
+                                r#"{{"jsonrpc":"2.0","id":999,"method":"eth_sendRawTransaction","params":["{}"]}}"#,
+                                tx_hex
+                            );
+                            if tx_outbox_clone.try_send(ws_broadcast).is_ok() {
+                                let _ = log_tx_clone.try_send(format!(
+                                    "[{}] 🚀 Sent via Hot WebSocket", bot_name));
+                            }
+                            
+                            // ═══════════════════════════════════════════════════════════
+                            // 2. FIRE VIA HTTP (The "Scattergun" Backup - ~5-20ms)
+                            // ═══════════════════════════════════════════════════════════
                             for provider in broadcast_providers_clone.iter() {
                                 let p = provider.clone();
                                 let tx = raw_tx.clone();
