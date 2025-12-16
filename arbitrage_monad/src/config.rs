@@ -57,11 +57,11 @@ pub const BROADCAST_ENDPOINTS: &[(&str, &str)] = &[
 pub const BASE_PRIORITY_GWEI: u128 = 30;
 
 /// Maximum priority fee cap in gwei (prevents overpaying)
-pub const MAX_PRIORITY_GWEI: u128 = 70;
+pub const MAX_PRIORITY_GWEI: u128 = 180;
 
 /// Minimum profit threshold (in 18 decimals) before adding profit-based priority
 /// 0.05 = 5 cents threshold
-pub const MIN_PROFIT_THRESHOLD: u128 = 50_000_000_000_000_000;
+pub const MIN_PROFIT_THRESHOLD: u128 = 100_000_000_000_000_000;
 
 /// Percentage of profit to add to priority fee (e.g., 2 = 2%)
 pub const PROFIT_SCALING_PERCENT: u128 = 2;
@@ -78,7 +78,7 @@ pub const GAS_LIMIT: u64 = 3_200_000;
 
 /// Cooldown: Skip checking a bot for N blocks after it broadcasts
 /// Set to 0 to disable (useful for high volatility periods)
-pub const COOLDOWN_BLOCKS: u64 = 2;
+pub const COOLDOWN_BLOCKS: u64 = 0;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOT CONFIGURATION
@@ -88,8 +88,10 @@ pub const COOLDOWN_BLOCKS: u64 = 2;
 /// Format: (address, name)  
 /// Comment out bots to disable them
 pub const BOTS: &[(&str, &str)] = &[
-    ("0x2315aa1ca4BfCCf33Ea6e963F9cFBe7d53a60B9e", "USDC-v7"),
-    ("0x7902990C53262e2684Ad87004F3E78a20a377e97", "AUSD-v7"),
+    // ("0xcba9708114edbc3eba7e85c941cdaec75ace63e2", "USDC-v6"),
+    // ("0x602410f69c9ec48cfcb3c5030d46a93f0180bc6b", "AUSD-v6"),
+    ("0xFF9aB730d101e5634eE133C0436E247f3520FefF", "USDC-v7"),
+    ("0x1E45ba2e6d56282a1F0d6A9E2147E5199eF0B913", "AUSD-v7"),
     // ("0xbee8762143c3a9f26831981d4871862fa7134d01", "Triangle-v3"),
 ];
 
