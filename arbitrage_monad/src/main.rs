@@ -1,7 +1,12 @@
 //! Experimental monadNewHeads arbitrage bot for Monad
 //! 
-//! Uses dynamic signing with in-memory nonce tracking for flexible priority fees.
+//! Uses single-socket architecture for state consistency.
+//! The same WebSocket handles both block notifications AND RPC calls.
 //! Optimized for low-latency execution with connection pooling and parallel broadcasts.
+
+// Use jemalloc for better memory allocation in hot paths
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod config;
 
@@ -13,7 +18,7 @@ use alloy::{
     sol,
 };
 use config::*;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -21,14 +26,16 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use url::Url;
 use tokio::sync::mpsc;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{client_async, tungstenite::Message};
+use tokio_native_tls::TlsConnector;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ZERO-COPY DESERIALIZATION STRUCTS
-// Avoids allocating HashMap/Vec/String for every field in the JSON tree
-// Uses #[serde(borrow)] to point to slices of the input string instead
+// ZERO-COPY COMBINED STRUCT (Safe Single-Pass for simd-json)
+// simd-json modifies buffer in-place, so we MUST parse exactly once
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
@@ -48,12 +55,22 @@ struct WsParams<'a> {
     result: MonadHeader<'a>,
 }
 
+// Combined message struct - handles BOTH notifications and responses in one parse
 #[derive(Deserialize)]
-struct WsNotification<'a> {
-    #[serde(borrow)]
-    method: &'a str,
-    #[serde(borrow)]
-    params: WsParams<'a>,
+struct CombinedMessage<'a> {
+    // Notification fields
+    #[serde(borrow, default)]
+    method: Option<&'a str>,
+    #[serde(borrow, default)]
+    params: Option<WsParams<'a>>,
+    
+    // Response fields
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(borrow, default)]
+    result: Option<&'a str>,
+    #[serde(default)]
+    error: Option<simd_json::OwnedValue>,
 }
 
 // Arbitrage contract interface
@@ -91,8 +108,9 @@ const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 #[derive(Clone)]
 struct ArbBot {
     address: Address,
-    name: Arc<str>,  // Arc<str> avoids cloning in hot path
-    tx_template: TxTemplate,  // Pre-computed tx fields for hot path
+    name: Arc<str>,
+    tx_template: TxTemplate,
+    last_bid_block: Arc<AtomicU64>,  // Lock-free cooldown tracking
 }
 
 // Pre-computed transaction template - avoids repeated calldata encoding in hot path
@@ -101,7 +119,7 @@ struct TxTemplate {
     to: Address,
     calldata: alloy::primitives::Bytes,  // Pre-encoded execute() call
     chain_id: u64,
-    gas_limit: u64,  // Alloy 1.x uses u64
+    gas_limit: u64,
 }
 
 impl TxTemplate {
@@ -132,7 +150,7 @@ impl TxTemplate {
     }
 }
 
-// Background receipt polling request (simplified for keeperProfit)
+// Background receipt polling request
 struct ReceiptRequest {
     tx_hash: alloy::primitives::B256,
     bot_name: Arc<str>,
@@ -141,6 +159,14 @@ struct ReceiptRequest {
     check_time: String,
     exec_time: String,
     receive_time: Instant,
+}
+
+// In-flight request tracking
+#[derive(Clone)]
+struct PendingRequest {
+    bots: Vec<ArbBot>,
+    receive_time: Instant,
+    block_num: u64,
 }
 
 fn format_wei(val: alloy::primitives::U256) -> String {
@@ -170,7 +196,7 @@ fn log_transaction(bot_name: &str, tx_hash: &str, block_detected: u64, block_exe
         .expect("Failed to open transaction log file");
     
     if !file_exists {
-        let header = "# Transaction Log (monadNewHeads + keeperProfit)\n\n| Timestamp | Bot | Tx Hash | Block Detected | Block Executed | Δ Blocks | Expected Profit | Check Time | Exec Time | Total Time |\n|-----------|-----|---------|----------------|----------------|----------|-----------------|------------|-----------|------------|\n";
+        let header = "# Transaction Log (monadNewHeads + Single-Socket)\n\n| Timestamp | Bot | Tx Hash | Block Detected | Block Executed | Δ Blocks | Expected Profit | Check Time | Exec Time | Total Time |\n|-----------|-----|---------|----------------|----------------|----------|-----------------|------------|-----------|------------|\n";
         file.write_all(header.as_bytes()).expect("Failed to write header");
     }
     
@@ -182,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║   MONAD NEW HEADS BOT - Alloy Native WebSocket             ║");
+    println!("║   MONAD NEW HEADS BOT - Single-Socket Architecture        ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
     
     let private_key = std::env::var("PRIVATE_KEY")?;
@@ -198,10 +224,8 @@ async fn main() -> anyhow::Result<()> {
             Err(std::env::VarError::NotPresent)
         })?;
     
-    let is_native_monad = ws_url.contains("monad.xyz") || ws_url.contains("monad-rpc");
-    
     // Detect provider from URL for display purposes
-    let provider_name = if is_native_monad { "Monad Native (monadNewHeads supported!)" }
+    let provider_name = if ws_url.contains("monad.xyz") || ws_url.contains("monad-rpc") { "Monad Native" }
         else if ws_url.contains("alchemy") { "Alchemy" }
         else if ws_url.contains("quiknode") || ws_url.contains("quicknode") { "QuickNode" }
         else if ws_url.contains("drpc") { "dRPC" }
@@ -210,8 +234,7 @@ async fn main() -> anyhow::Result<()> {
         else if ws_url.contains("ankr") { "Ankr" }
         else { "Other" };
     
-    println!("🔌 WebSocket: {} {}", provider_name, 
-        if is_native_monad { "" } else { "(fallback to newHeads)" });
+    println!("🔌 Single-Socket Mode: {}", provider_name);
     
     // Build bots from config
     let bots: Vec<ArbBot> = get_bot_addresses()
@@ -220,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             address: addr,
             name: Arc::from(name),
             tx_template: TxTemplate::new(addr),
+            last_bid_block: Arc::new(AtomicU64::new(0)),
         })
         .collect();
     
@@ -253,100 +277,45 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -> anyhow::Result<()> {
+    use alloy::sol_types::SolCall;
+    
     let signer = PrivateKeySigner::from_str(&private_key)?;
     let wallet_address = signer.address();
     let wallet = EthereumWallet::from(signer);
     
-    // Pre-create broadcast providers at startup (connection pooling - saves ~10-50ms per broadcast)
-    // Note: reqwest has TCP_NODELAY enabled by default, so we get this optimization for free!
+    // Pre-create broadcast providers at startup (for transaction broadcasts only)
     let mut broadcast_providers: Vec<Arc<dyn Provider + Send + Sync>> = vec![];
     
     for (env_var, name) in BROADCAST_ENDPOINTS {
         if let Ok(url) = std::env::var(env_var) {
             if let Ok(parsed) = Url::parse(&url) {
-                // Use connect_http - TCP_NODELAY is enabled by default in reqwest
                 let provider = ProviderBuilder::new().connect_http(parsed);
                 broadcast_providers.push(Arc::new(provider));
-                println!("📡 {} (TCP_NODELAY)", name);
+                println!("📡 {} (broadcast only)", name);
             }
         }
     }
-    println!("🔗 Broadcast providers: {} (TCP_NODELAY enabled)", broadcast_providers.len());
+    println!("🔗 Broadcast providers: {}", broadcast_providers.len());
     
     let broadcast_providers = Arc::new(broadcast_providers);
     let wallet_arc = Arc::new(wallet.clone());
     
-    // Create HTTP provider for RPC calls (TCP_NODELAY enabled by default in reqwest)
+    // HTTP provider for initial nonce fetch and receipt polling only
     let rpc_url = std::env::var(PRIMARY_HTTPS_ENV)?;
     let http_provider = ProviderBuilder::new()
         .wallet(wallet.clone())
         .connect_http(Url::parse(&rpc_url)?);
     let http_provider = Arc::new(http_provider);
     
-    // ========== RPC HEALTH CHECK ==========
-    // Test RPC latency at startup to catch slow endpoints early
-    println!("\n🔍 Testing RPC latency ({})...", PRIMARY_HTTPS_ENV);
-    let health_provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url)?);
-    let mut latencies: Vec<u128> = vec![];
-    for i in 1..=3 {
-        let start = Instant::now();
-        let _ = health_provider.get_block_number().await?;
-        let elapsed = start.elapsed().as_millis();
-        latencies.push(elapsed);
-        print!("   Test {}: {}ms", i, elapsed);
-        if elapsed > 100 { print!(" ⚠️"); }
-        println!();
-    }
-    let avg_latency = latencies.iter().sum::<u128>() / latencies.len() as u128;
-    if avg_latency > 100 {
-        println!("⚠️  WARNING: RPC latency is HIGH ({}ms avg) - consider using a faster endpoint!", avg_latency);
-        println!("   Recommended: QUICKNODE_HTTPS (~35-50ms)");
-    } else if avg_latency > 50 {
-        println!("⚡ RPC latency OK: {}ms avg", avg_latency);
-    } else {
-        println!("🚀 RPC latency EXCELLENT: {}ms avg", avg_latency);
-    }
-    
-    // Test pending state access (critical for monadNewHeads strategy)
-    println!("\n🔍 Testing pending state access...");
-    use alloy::eips::BlockNumberOrTag;
-    let latest_block = health_provider.get_block_number().await?;
-    let pending_result = health_provider.get_block_by_number(BlockNumberOrTag::Pending).await;
-    match pending_result {
-        Ok(Some(pending_block)) => {
-            let pending_num = pending_block.header.number;
-            let diff = pending_num.saturating_sub(latest_block);
-            if diff >= 1 {
-                println!("✅ Pending state: Block {} (latest: {}, ahead by {})", pending_num, latest_block, diff);
-                println!("   Provider has fresh consensus state!");
-            } else {
-                println!("⚡ Pending state: Block {} (same as latest {})", pending_num, latest_block);
-                println!("   Provider may not have real-time consensus - still usable");
-            }
-        }
-        Ok(None) => {
-            println!("⚠️  WARNING: Pending block returned None - provider may not support pending queries");
-        }
-        Err(e) => {
-            println!("⚠️  WARNING: Failed to query pending state: {:?}", e);
-            println!("   This may affect performance with monadNewHeads strategy");
-        }
-    }
-    println!();
-    
-    // Atomic nonce tracking - single shared nonce for all bots (same wallet)
-    let initial_nonce = {
-        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url)?);
-        provider.get_transaction_count(wallet_address).await?
-    };
+    // Get initial nonce
+    let initial_nonce = http_provider.get_transaction_count(wallet_address).await?;
     let shared_nonce = Arc::new(AtomicU64::new(initial_nonce));
     
     println!("👛 Wallet: {:?}", wallet_address);
     println!("🔢 Initial nonce: {}", initial_nonce);
-    println!("⚡ Dynamic signing + connection pooling enabled");
     
-    // ========== BACKGROUND LOG CHANNEL ==========
-    // Non-blocking logging - hot-path uses try_send() which never blocks
+    // ========== BACKGROUND CHANNELS ==========
+    // Non-blocking logging
     let (log_tx, mut log_rx) = mpsc::channel::<String>(500);
     tokio::spawn(async move {
         while let Some(msg) = log_rx.recv().await {
@@ -354,7 +323,7 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
         }
     });
     
-    // Background receipt polling - moves receipt fetching OFF the critical path
+    // Background receipt polling
     let (receipt_tx, mut receipt_rx) = mpsc::channel::<ReceiptRequest>(100);
     let receipt_provider = http_provider.clone();
     tokio::spawn(async move {
@@ -386,298 +355,341 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
         }
     });
     
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // ========== SINGLE-SOCKET WEBSOCKET WITH TCP_NODELAY ==========
+    println!("\n🔌 Connecting Single-Socket WebSocket (TCP_NODELAY Enabled)...");
     
-    // ========== RAW WEBSOCKET FOR monadNewHeads ==========
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
-    use futures::SinkExt;
+    let url = Url::parse(&ws_url)?;
+    let host = url.host_str().ok_or(anyhow::anyhow!("Invalid host in WebSocket URL"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let use_tls = url.scheme() == "wss";
     
-    println!("\n🔌 Connecting via raw WebSocket for monadNewHeads...");
+    // 1. Manually establish TCP connection
+    let tcp_stream = TcpStream::connect((host, port)).await?;
     
-    let (mut ws_stream, _) = connect_async(&ws_url).await?;
-    println!("✅ Raw WebSocket connected");
+    // 2. CRITICAL: Disable Nagle's Algorithm for immediate packet sending
+    tcp_stream.set_nodelay(true)?;
+    println!("⚡ TCP_NODELAY set to true");
     
-    // Subscribe to monadNewHeads (Monad-specific early block notification)
-    let subscribe_msg = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_subscribe",
-        "params": ["monadNewHeads", {}]
-    });
+    // 3. Upgrade to WebSocket (with TLS if wss://)
+    // Use MaybeTlsStream to unify types between TLS and plain connections
+    use tokio_tungstenite::MaybeTlsStream;
     
-    ws_stream.send(Message::Text(subscribe_msg.to_string())).await?;
-    println!("📤 Sent monadNewHeads subscription request");
+    let ws_stream = if use_tls {
+        // Build native-tls connector
+        let tls_connector = native_tls::TlsConnector::new()?;
+        let tls_connector = TlsConnector::from(tls_connector);
+        let tls_stream = tls_connector.connect(host, tcp_stream).await?;
+        
+        // Wrap in MaybeTlsStream for unified type
+        let wrapped = MaybeTlsStream::NativeTls(tls_stream);
+        
+        // Upgrade to WebSocket (handshake only - TLS already done)
+        let (ws, _) = client_async(url.as_str(), wrapped).await?;
+        ws
+    } else {
+        // Plain ws:// (no TLS) - wrap for unified type
+        let wrapped: MaybeTlsStream<TcpStream> = MaybeTlsStream::Plain(tcp_stream);
+        
+        // Just WebSocket handshake
+        let (ws, _) = client_async(url.as_str(), wrapped).await?;
+        ws
+    };
+    println!("✅ Single-Socket connected ({})", if use_tls { "TLS" } else { "Plain" });
     
-    // Wait for subscription confirmation
-    let mut sub_type = "UNKNOWN";
-    if let Some(Ok(msg)) = ws_stream.next().await {
-        if let Message::Text(text) = msg {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(result) = json.get("result") {
-                    if result.as_str().is_some() {
-                        sub_type = "MONAD_NEW_HEADS";
-                        println!("🚀 monadNewHeads subscription confirmed! ID: {}", result);
-                    }
-                }
-                if let Some(error) = json.get("error") {
-                    println!("⚠️ monadNewHeads failed: {:?}", error);
-                    println!("📦 Falling back to standard newHeads...");
-                    
-                    // Subscribe to standard newHeads instead
-                    let fallback_msg = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "eth_subscribe",
-                        "params": ["newHeads"]
-                    });
-                    ws_stream.send(Message::Text(fallback_msg.to_string())).await?;
-                    
-                    if let Some(Ok(msg2)) = ws_stream.next().await {
-                        if let Message::Text(text2) = msg2 {
-                            if let Ok(json2) = serde_json::from_str::<serde_json::Value>(&text2) {
-                                if let Some(result2) = json2.get("result") {
-                                    sub_type = "STD_NEW_HEADS";
-                                    println!("✅ Standard newHeads subscription confirmed! ID: {}", result2);
-                                }
-                            }
-                        }
-                    }
-                }
+    // Split into writer and reader
+    let (ws_write, mut ws_read) = ws_stream.split();
+    
+    // Outbox channel for sending messages to the socket
+    let (tx_outbox, mut rx_outbox) = mpsc::channel::<String>(1000);
+    
+    // Spawn writer task (takes ownership - no Mutex needed)
+    let mut ws_write = ws_write;
+    tokio::spawn(async move {
+        while let Some(msg) = rx_outbox.recv().await {
+            if let Err(e) = ws_write.send(Message::Text(msg)).await {
+                println!("⚠️ WS Write Error: {:?}", e);
+                break;
             }
         }
-    }
+    });
     
-    println!("✅ Subscription type: {}\n", sub_type);
-    println!("🎯 Listening for block notifications...\n");
+    // Subscribe to monadNewHeads (using format! for speed)
+    let subscribe_msg = r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["monadNewHeads",{}]}"#;
+    tx_outbox.send(subscribe_msg.to_string()).await?;
+    println!("📤 Sent monadNewHeads subscription");
     
-    // Track seen blocks to deduplicate (some providers send multiple notifications per block)
-    let mut seen_blocks: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let max_seen_history = 20;
+    // ========== PRE-ENCODE MULTICALL CALLDATA ==========
+    // Build once, reuse for every block
+    let keeper_profit_call = Arbitrage::keeperProfitCall {};
+    let keeper_calldata = alloy::primitives::Bytes::from(keeper_profit_call.abi_encode());
     
-    // Per-bot cooldown tracking: last block each bot bid on
-    let last_bid_block: Arc<tokio::sync::RwLock<HashMap<Address, u64>>> = 
-        Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    // Build Call3 array for all bots
+    let calls: Vec<Multicall3::Call3> = bots.iter()
+        .map(|bot| Multicall3::Call3 {
+            target: bot.address,
+            allowFailure: true,
+            callData: keeper_calldata.clone(),
+        })
+        .collect();
+    
+    // Encode full multicall
+    let multicall_instance = Multicall3::aggregate3Call { calls };
+    let multicall_encoded = multicall_instance.abi_encode();
+    let multicall_hex = format!("0x{}", hex::encode(&multicall_encoded));
+    let multicall_target = MULTICALL3_ADDRESS;
+    
+    println!("📦 Pre-encoded multicall for {} bots ({} bytes)", bots.len(), multicall_encoded.len());
     
     if COOLDOWN_BLOCKS > 0 {
-        println!("🧊 Cooldown enabled: {} blocks after each bid", COOLDOWN_BLOCKS);
-    } else {
-        println!("⚡ Cooldown disabled (volatility mode)");
+        println!("🧊 Cooldown: {} blocks (lock-free AtomicU64)", COOLDOWN_BLOCKS);
     }
     
-    while let Some(msg_result) = ws_stream.next().await {
+    // Track in-flight requests (block_num -> request metadata)
+    let pending_requests: Arc<tokio::sync::RwLock<FxHashMap<u64, PendingRequest>>> =
+        Arc::new(tokio::sync::RwLock::new(FxHashMap::default()));
+    
+    // Track seen blocks
+    let mut seen_blocks: FxHashSet<u64> = FxHashSet::default();
+    let max_seen_history = 20;
+    
+    println!("\n🎯 Single-Socket Event Loop started (Safe SIMD Mode)...\n");
+    
+    // ========== THE EVENT LOOP ==========
+    while let Some(msg_result) = ws_read.next().await {
         match msg_result {
-            Ok(Message::Text(text)) => {
-                // ========== ZERO-COPY DESERIALIZATION ==========
-                // Uses typed structs with #[serde(borrow)] to avoid allocations
-                if let Ok(notif) = serde_json::from_str::<WsNotification>(&text) {
-                    if notif.method == "eth_subscription" {
-                        let header = &notif.params.result;
-                        
-                        // For monadNewHeads: only act on "Proposed" state (earliest notification)
-                        // For standard newHeads: commitState won't exist, so process all blocks
-                        if let Some(state) = header.commitState {
-                            if state != "Proposed" {
-                                continue;  // monadNewHeads: skip non-Proposed states
-                            }
-                        }
-                        // If commitState is None, it's standard newHeads - process it!
-                        
-                        // Extract block number (handle hex format) - direct field access, no .get() chains
-                        let block_num = u64::from_str_radix(header.number.trim_start_matches("0x"), 16).unwrap_or(0);
-                        if block_num == 0 {
-                            continue;
-                        }
-                        
-                        // Deduplicate (shouldn't be needed now with Proposed filter, but safety)
-                        if seen_blocks.contains(&block_num) {
-                            continue;
-                        }
-                        seen_blocks.insert(block_num);
-                        
-                        // Prune old entries
-                        if seen_blocks.len() > max_seen_history {
-                            if let Some(&min_block) = seen_blocks.iter().min() {
-                                seen_blocks.remove(&min_block);
-                            }
-                        }
-                        
-                        let receive_time = Instant::now();
-                        
-                        // Extract timestamp - direct field access
-                        let block_timestamp = u64::from_str_radix(header.timestamp.trim_start_matches("0x"), 16).unwrap_or(0);
-                        let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        let latency = now_unix.saturating_sub(block_timestamp);
-                        
-                        println!("\n══════════════════════════════════════════════════════════");
-                        println!("🚀 PROPOSED Block #{} | Latency: {}s | Querying PENDING!", block_num, latency);
-                        
-                        // ========== MULTICALL: BATCH ALL PROFIT CHECKS INTO 1 RPC CALL ==========
-                        // Instead of N separate RPC calls, we make 1 multicall and decode results
-                        use alloy::sol_types::SolCall;
-                        use alloy::eips::BlockNumberOrTag;
-                        
-                        // Filter bots by cooldown first (local check, no RPC needed)
-                        let active_bots: Vec<&ArbBot> = {
-                            let last_bid = last_bid_block.read().await;
-                            bots.iter().filter(|bot| {
-                                if COOLDOWN_BLOCKS == 0 { return true; }
-                                match last_bid.get(&bot.address) {
-                                    Some(&last_block) => block_num > last_block + COOLDOWN_BLOCKS,
-                                    None => true,
+            Ok(Message::Text(mut text)) => {
+                // SIMD-JSON: Get mutable bytes for in-place parsing (2-3x faster)
+                // SAFETY: WebSocket text messages are guaranteed valid UTF-8
+                let bytes = unsafe { text.as_bytes_mut() };
+                
+                // ⚡ SINGLE-PASS PARSING ⚡
+                // simd-json modifies buffer in-place, so we MUST parse exactly once
+                let msg: CombinedMessage = match simd_json::from_slice(bytes) {
+                    Ok(m) => m,
+                    Err(_) => continue, // Skip invalid JSON
+                };
+                
+                // --- PATH A: BLOCK NOTIFICATION ---
+                // It's a notification if 'method' exists
+                if let Some(method_str) = msg.method {
+                    if method_str == "eth_subscription" {
+                        if let Some(params) = msg.params {
+                            let header = &params.result;
+                            
+                            // Only act on "Proposed" state (earliest)
+                            if let Some(state) = header.commitState {
+                                if state != "Proposed" {
+                                    // Log other states for visibility
+                                    let block_num = u64::from_str_radix(header.number.trim_start_matches("0x"), 16).unwrap_or(0);
+                                    let _ = log_tx.try_send(format!("   {} Block #{}", 
+                                        if state == "Voted" { "🗳️" } else { "✅" }, block_num));
+                                    continue;
                                 }
-                            }).collect()
+                            }
+                            
+                            let block_num = u64::from_str_radix(header.number.trim_start_matches("0x"), 16).unwrap_or(0);
+                            if block_num == 0 { continue; }
+                            
+                            // Deduplicate
+                            if seen_blocks.contains(&block_num) { continue; }
+                            seen_blocks.insert(block_num);
+                            if seen_blocks.len() > max_seen_history {
+                                if let Some(&min_block) = seen_blocks.iter().min() {
+                                    seen_blocks.remove(&min_block);
+                                }
+                            }
+                            
+                            let receive_time = Instant::now();
+                            let block_timestamp = u64::from_str_radix(header.timestamp.trim_start_matches("0x"), 16).unwrap_or(0);
+                            let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            let latency = now_unix.saturating_sub(block_timestamp);
+                            
+                            println!("\n══════════════════════════════════════════════════════════");
+                            println!("🚀 PROPOSED Block #{} | Latency: {}s", block_num, latency);
+                            
+                            // Store pending request with ALL bots
+                            {
+                                let mut pending = pending_requests.write().await;
+                                pending.insert(block_num, PendingRequest {
+                                    bots: bots.clone(),
+                                    receive_time,
+                                    block_num,
+                                });
+                                pending.retain(|&k, _| k > block_num.saturating_sub(10));
+                            }
+                            
+                            // Send eth_call via same WebSocket
+                            let request = format!(
+                                r#"{{"jsonrpc":"2.0","id":{},"method":"eth_call","params":[{{"to":"{}","data":"{}"}},"pending"]}}"#,
+                                block_num, multicall_target, multicall_hex
+                            );
+                            
+                            let _ = tx_outbox.try_send(request);
+                        }
+                    }
+                    continue; // Done with notification
+                }
+                
+                // --- PATH B: RPC RESPONSE ---
+                // It's a response if 'id' exists and 'method' is missing
+                if let Some(id) = msg.id {
+                    if id <= 1 { continue; } // Skip subscription confirmation
+                    
+                    let block_id = id;
+                    
+                    // Check for errors
+                    if let Some(error) = msg.error {
+                        println!("⚠️ RPC Error for block {}: {:?}", block_id, error);
+                        continue;
+                    }
+                    
+                    let result_hex = match msg.result {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    
+                    // Get pending request metadata
+                    let pending_req = {
+                        let pending = pending_requests.read().await;
+                        pending.get(&block_id).cloned()
+                    };
+                    
+                    let (all_bots, receive_time) = match pending_req {
+                        Some(req) => (req.bots, req.receive_time),
+                        None => continue,
+                    };
+                    
+                    let check_elapsed = receive_time.elapsed();
+                    println!("📦 Single-Socket Response ({} bots) in {:?}", all_bots.len(), check_elapsed);
+                    
+                    // Decode result
+                    let result_bytes = match hex::decode(result_hex.trim_start_matches("0x")) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    
+                    // Decode Multicall response
+                    let multicall_returns = match Multicall3::aggregate3Call::abi_decode_returns(&result_bytes) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            println!("⚠️ Multicall decode error: {:?}", e);
+                            continue;
+                        }
+                    };
+                    
+                    // Process each bot's result
+                    for (i, result) in multicall_returns.iter().enumerate() {
+                        if i >= all_bots.len() { break; }
+                        if !result.success { continue; }
+                        
+                        // Decode keeperProfit return
+                        let decoded = match Arbitrage::keeperProfitCall::abi_decode_returns(&result.returnData) {
+                            Ok(d) => d,
+                            Err(_) => continue,
                         };
                         
-                        if active_bots.is_empty() {
-                            println!("⏸️ All bots in cooldown");
-                            continue;
+                        if !decoded.profitable { continue; }
+                        
+                        let bot = &all_bots[i];
+                        let expected_profit = decoded.expectedProfit;
+                        
+                        // Check cooldown using lock-free AtomicU64
+                        if COOLDOWN_BLOCKS > 0 {
+                            let last = bot.last_bid_block.load(Ordering::Relaxed);
+                            if block_id <= last + COOLDOWN_BLOCKS {
+                                continue;
+                            }
                         }
                         
-                        // Pre-encode keeperProfit() calldata once (reused for all bots)
-                        let keeper_profit_call = Arbitrage::keeperProfitCall {};
-                        let calldata = alloy::primitives::Bytes::from(keeper_profit_call.abi_encode());
+                        // Mark cooldown immediately
+                        if COOLDOWN_BLOCKS > 0 {
+                            bot.last_bid_block.store(block_id, Ordering::Relaxed);
+                        }
                         
-                        // Build Call3 array for all active bots
-                        let calls: Vec<Multicall3::Call3> = active_bots.iter()
-                            .map(|bot| Multicall3::Call3 {
-                                target: bot.address,
-                                allowFailure: true,  // Don't revert entire call if one bot fails
-                                callData: calldata.clone(),
-                            })
-                            .collect();
+                        // Spawn tx signing/broadcast
+                        let bot_name = bot.name.clone();
+                        let tx_template = bot.tx_template.clone();
+                        let receive_time_clone = receive_time;
+                        let block_num_clone = block_id;
+                        let broadcast_providers_clone = broadcast_providers.clone();
+                        let nonce_clone = shared_nonce.clone();
+                        let wallet_clone = wallet_arc.clone();
+                        let receipt_tx_clone = receipt_tx.clone();
+                        let log_tx_clone = log_tx.clone();
+                        let check_elapsed_clone = check_elapsed;
                         
-                        let check_start = Instant::now();
-                        
-                        // Single RPC call for all bots!
-                        let multicall_addr = Address::from_str(MULTICALL3_ADDRESS).unwrap();
-                        let multicall = Multicall3::new(multicall_addr, (*http_provider).clone());
-                        
-                        let multicall_result = multicall.aggregate3(calls.clone())
-                            .block(BlockNumberOrTag::Pending.into())
-                            .call()
-                            .await;
-                        
-                        let check_elapsed = check_start.elapsed();
-                        println!("📦 Multicall ({} bots) in {:?}", active_bots.len(), check_elapsed);
-                        
-                        match multicall_result {
-                            Ok(results) => {
-                                // Decode and process results for each bot
-                                for (i, result) in results.iter().enumerate() {
-                                    if !result.success {
-                                        continue;
-                                    }
-                                    
-                                    // Decode keeperProfit return data: (bool profitable, uint256 expectedProfit)
-                                    let decoded = match Arbitrage::keeperProfitCall::abi_decode_returns(&result.returnData) {
-                                        Ok(d) => d,
-                                        Err(_) => continue,
-                                    };
-                                    
-                                    if !decoded.profitable {
-                                        continue;
-                                    }
-                                    
-                                    let bot = active_bots[i];
-                                    let expected_profit = decoded.expectedProfit;
-                                    
-                                    // Mark cooldown immediately
-                                    if COOLDOWN_BLOCKS > 0 {
-                                        let mut last_bid = last_bid_block.write().await;
-                                        last_bid.insert(bot.address, block_num);
-                                    }
-                                    
-                                    // Spawn tx signing/broadcast task
-                                    let bot_name = bot.name.clone();
-                                    let tx_template = bot.tx_template.clone();
-                                    let receive_time_clone = receive_time;
-                                    let block_num_clone = block_num;
-                                    let broadcast_providers_clone = broadcast_providers.clone();
-                                    let nonce_clone = shared_nonce.clone();
-                                    let wallet_clone = wallet_arc.clone();
-                                    let receipt_tx_clone = receipt_tx.clone();
-                                    let log_tx_clone = log_tx.clone();
-                                    let check_elapsed_clone = check_elapsed;
-                                    
-                                    tokio::spawn(async move {
-                                        let _ = log_tx_clone.try_send(format!(
-                                            "[{}] 🎯 PROFITABLE! Block {} Profit: {} (multicall: {:?})", 
-                                            bot_name, block_num_clone, format_wei(expected_profit), check_elapsed_clone));
-                                        
-                                        let exec_start = Instant::now();
-                                        
-                                        use alloy::eips::eip2718::Encodable2718;
-                                        use alloy::network::TransactionBuilder;
-                                        
-                                        let current_nonce = nonce_clone.fetch_add(1, Ordering::SeqCst);
-                                        let profit_u128: u128 = expected_profit.try_into().unwrap_or(0);
-                                        let priority_fee = calculate_priority_fee(profit_u128);
-                                        let priority_gwei = priority_fee / 1_000_000_000;
-                                        
-                                        let tx_request = tx_template.build_with(current_nonce, priority_fee);
-                                        
-                                        let tx_envelope = match tx_request.build(&*wallet_clone).await {
-                                            Ok(e) => e,
-                                            Err(err) => {
-                                                let _ = log_tx_clone.try_send(format!(
-                                                    "[{}] ⚠️ Failed to sign tx: {:?}", bot_name, err));
-                                                return;
-                                            }
-                                        };
-                                        
-                                        let mut raw_tx_vec = Vec::with_capacity(512);
-                                        tx_envelope.encode_2718(&mut raw_tx_vec);
-                                        let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
-                                        let tx_hash = *tx_envelope.tx_hash();
-                                        
-                                        let total_exec = exec_start.elapsed();
-                                        let _ = log_tx_clone.try_send(format!(
-                                            "[{}] ⚡ Signed tx nonce={} priority={}gwei (sign: {:?})", 
-                                            bot_name, current_nonce, priority_gwei, total_exec));
-                                        
-                                        // Fire-and-forget broadcasts - spawn each individually, don't wait
-                                        let bot_name_receipt = bot_name.clone();
-                                        for provider in broadcast_providers_clone.iter() {
-                                            let p = provider.clone();
-                                            let tx = raw_tx.clone();
-                                            tokio::spawn(async move {
-                                                let _ = p.send_raw_transaction(&tx).await;
-                                            });
-                                        }
-                                        
-                                        // Non-blocking receipt request
-                                        let _ = receipt_tx_clone.try_send(ReceiptRequest {
-                                            tx_hash,
-                                            bot_name: bot_name_receipt,
-                                            block_detected: block_num_clone,
-                                            expected_profit: format_wei(expected_profit),
-                                            check_time: format!("{:?}", check_elapsed_clone),
-                                            exec_time: format!("{:?}", total_exec),
-                                            receive_time: receive_time_clone,
-                                        });
-                                    });
+                        tokio::spawn(async move {
+                            let _ = log_tx_clone.try_send(format!(
+                                "[{}] 🎯 PROFITABLE! Block {} Profit: {} (simd: {:?})", 
+                                bot_name, block_num_clone, format_wei(expected_profit), check_elapsed_clone));
+                            
+                            let exec_start = Instant::now();
+                            
+                            use alloy::eips::eip2718::Encodable2718;
+                            use alloy::network::TransactionBuilder;
+                            
+                            let current_nonce = nonce_clone.fetch_add(1, Ordering::SeqCst);
+                            let profit_u128: u128 = expected_profit.try_into().unwrap_or(0);
+                            let priority_fee = calculate_priority_fee(profit_u128);
+                            let priority_gwei = priority_fee / 1_000_000_000;
+                            
+                            let tx_request = tx_template.build_with(current_nonce, priority_fee);
+                            
+                            let tx_envelope = match tx_request.build(&*wallet_clone).await {
+                                Ok(e) => e,
+                                Err(err) => {
+                                    let _ = log_tx_clone.try_send(format!(
+                                        "[{}] ⚠️ Failed to sign tx: {:?}", bot_name, err));
+                                    return;
                                 }
+                            };
+                            
+                            let mut raw_tx_vec = Vec::with_capacity(512);
+                            tx_envelope.encode_2718(&mut raw_tx_vec);
+                            let raw_tx = alloy::primitives::Bytes::from(raw_tx_vec);
+                            let tx_hash = *tx_envelope.tx_hash();
+                            
+                            let total_exec = exec_start.elapsed();
+                            let _ = log_tx_clone.try_send(format!(
+                                "[{}] ⚡ Signed tx nonce={} priority={}gwei (sign: {:?})", 
+                                bot_name, current_nonce, priority_gwei, total_exec));
+                            
+                            // Parallel broadcasts
+                            for provider in broadcast_providers_clone.iter() {
+                                let p = provider.clone();
+                                let tx = raw_tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = p.send_raw_transaction(&tx).await;
+                                });
                             }
-                            Err(e) => {
-                                println!("⚠️ Multicall failed: {:?}", e);
-                            }
-                        }
-                        
-                        println!("⚡ Processed {} bots via multicall in {:?}", active_bots.len(), receive_time.elapsed());
+                            
+                            // Background receipt polling
+                            let _ = receipt_tx_clone.try_send(ReceiptRequest {
+                                tx_hash,
+                                bot_name,
+                                block_detected: block_num_clone,
+                                expected_profit: format_wei(expected_profit),
+                                check_time: format!("{:?}", check_elapsed_clone),
+                                exec_time: format!("{:?}", total_exec),
+                                receive_time: receive_time_clone,
+                            });
+                        });
                     }
+                    
+                    println!("⚡ Processed block {} via single-socket in {:?}", block_id, receive_time.elapsed());
                 }
             }
-            Ok(Message::Ping(data)) => {
-                let _ = ws_stream.send(Message::Pong(data)).await;
+            Ok(Message::Ping(_data)) => {
+                // Pong is handled by the underlying tungstenite layer automatically
+                // when using the higher-level API. If needed, we'd need to expand
+                // the outbox to handle Message types, but for now this is fine.
             }
             Err(e) => {
-                // Return error to trigger reconnection in main loop
                 return Err(anyhow::anyhow!("WebSocket error: {:?}", e));
             }
             _ => {}
         }
     }
     
-    // If we reach here, the WebSocket stream ended (server closed connection)
     Err(anyhow::anyhow!("WebSocket stream ended unexpectedly"))
 }
