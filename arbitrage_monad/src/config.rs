@@ -24,6 +24,10 @@ pub const FALLBACK_WS_ENVS: &[&str] = &[
     "DRPC_WS",
 ];
 
+/// Use monadNewHeads (Monad-native) vs standard newHeads
+/// Set to false for providers that don't support monadNewHeads
+pub const USE_MONAD_NEW_HEADS: bool = true;
+
 /// Primary HTTPS endpoint for RPC calls (calculateProfit, nonce, etc.)
 // pub const PRIMARY_HTTPS_ENV: &str = "QUICKNODE_HTTPS";
 pub const PRIMARY_HTTPS_ENV: &str = "CHAINSTACK_HTTP";

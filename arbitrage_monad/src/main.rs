@@ -413,10 +413,14 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
         }
     });
     
-    // Subscribe to monadNewHeads (using format! for speed)
-    let subscribe_msg = r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["monadNewHeads",{}]}"#;
+    // Subscribe to block notifications (monadNewHeads for Monad-native, newHeads for standard)
+    let subscribe_msg = if USE_MONAD_NEW_HEADS {
+        r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["monadNewHeads",{}]}"#
+    } else {
+        r#"{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}"#
+    };
     tx_outbox.send(subscribe_msg.to_string()).await?;
-    println!("📤 Sent monadNewHeads subscription");
+    println!("📤 Sent {} subscription", if USE_MONAD_NEW_HEADS { "monadNewHeads" } else { "newHeads" });
     
     // ========== PRE-ENCODE MULTICALL CALLDATA ==========
     // Build once, reuse for every block
