@@ -1,0 +1,104 @@
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║                    MONAD ARBITRAGE KEEPER CONFIGURATION                    ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+# Edit this file to change settings without recompiling.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NETWORK CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[network]
+chain_id = 143
+
+# Primary WebSocket endpoint for block subscriptions (env var name)
+primary_ws_env = "CHAINSTACK_WS"
+# Fallback WebSocket endpoints (tried in order if primary fails)
+fallback_ws_envs = ["ALCHEMY_WEBSOCKET_API", "DRPC_WS"]
+
+# Use monadNewHeads (Monad-native) vs standard newHeads
+use_monad_new_heads = true
+
+# Primary HTTPS endpoint for RPC calls (env var name)
+primary_https_env = "CHAINSTACK_HTTP"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BROADCAST ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Transactions are sent to ALL of these in parallel
+# Format: { env = "ENV_VAR_NAME", name = "Display Name" }
+
+[[broadcast]]
+env = "QUICKNODE_HTTPS"
+name = "QuickNode"
+
+[[broadcast]]
+env = "INFURA_HTTPS_API"
+name = "Infura"
+
+[[broadcast]]
+env = "ALCHEMY_HTTPS_API"
+name = "Alchemy"
+
+[[broadcast]]
+env = "ANKR_HTTPS"
+name = "Ankr"
+
+[[broadcast]]
+env = "DRPC_HTTPS"
+name = "dRPC"
+
+[[broadcast]]
+env = "CHAINSTACK_HTTP"
+name = "Chainstack"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRIORITY FEE CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[fees]
+# Base priority fee in gwei (applied to all transactions)
+base_priority_gwei = 30
+# Maximum priority fee cap in gwei (prevents overpaying)
+max_priority_gwei = 400
+# Base max fee per gas in gwei (added to priority fee)
+base_max_fee_gwei = 100
+
+# Minimum profit threshold (in wei, 1e17 = 0.1 token) before adding profit-based priority
+min_profit_threshold = 100_000_000_000_000_000
+# Percentage of profit to add to priority fee (e.g., 10 = 10%)
+profit_scaling_percent = 10
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRANSACTION CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[transaction]
+# Gas limit for execute() transactions
+gas_limit = 4_000_000
+# Cooldown: Skip checking a bot for N blocks after it broadcasts
+# Set to 0 to disable (useful for high volatility periods)
+cooldown_blocks = 1
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOT CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+# Comment out or remove bots to disable them
+
+[[bots]]
+address = "0x11a4cadab2662fd611052275ba4b0624f8291e95"
+name = "USDC-v8"
+
+[[bots]]
+address = "0xc52f4d116ef28ba73808cddd87a0b9d81d0fd996"
+name = "AUSD-v8"
+
+# [[bots]]
+# address = "0xbee8762143c3a9f26831981d4871862fa7134d01"
+# name = "Triangle-v3"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[logging]
+tx_log_file = "transactions_monad.md"

@@ -19,6 +19,7 @@ tokio-native-tls = "0.3"          # For manual TLS with TCP_NODELAY
 rustc-hash = "1.1"                # 2x faster hashmaps
 tikv-jemallocator = "0.6"
 simd-json = "0.14"
+toml = "0.8"
 
 
 [profile.release]

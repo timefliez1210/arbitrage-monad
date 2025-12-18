@@ -1,136 +1,134 @@
 //! Configuration module for the Monad Arbitrage Keeper
 //! 
-//! Edit this file to change RPC endpoints, fee parameters, and bot settings.
+//! Loads configuration from `config.toml` at startup for faster iteration.
+//! No recompilation needed to change settings.
 
 use alloy::primitives::Address;
+use serde::Deserialize;
+use std::fs;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NETWORK CONFIGURATION
+// TOML CONFIGURATION STRUCTURES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Chain ID for the target network
-pub const CHAIN_ID: u64 = 143;
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub network: NetworkConfig,
+    pub fees: FeesConfig,
+    pub transaction: TransactionConfig,
+    #[serde(rename = "broadcast")]
+    pub broadcast_endpoints: Vec<BroadcastEndpoint>,
+    pub bots: Vec<BotConfig>,
+    pub logging: LoggingConfig,
+}
 
-/// Primary WebSocket endpoint for block subscriptions
-/// Supports: Monad native (monadNewHeads), QuickNode, Alchemy, dRPC
-// pub const PRIMARY_WS_ENV: &str = "QUICKNODE_WS";
-pub const PRIMARY_WS_ENV: &str = "CHAINSTACK_WS";
-// pub const PRIMARY_WS_ENV: &str = "DRPC_WS";
+#[derive(Debug, Deserialize)]
+pub struct NetworkConfig {
+    pub chain_id: u64,
+    pub primary_ws_env: String,
+    #[serde(default)]
+    pub fallback_ws_envs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub use_monad_new_heads: bool,
+    pub primary_https_env: String,
+}
 
-/// Fallback WebSocket endpoints (tried in order if primary fails)
-pub const FALLBACK_WS_ENVS: &[&str] = &[
-    "ALCHEMY_WEBSOCKET_API",
-    "DRPC_WS",
-];
+#[derive(Debug, Deserialize)]
+pub struct FeesConfig {
+    pub base_priority_gwei: u64,
+    pub max_priority_gwei: u64,
+    pub base_max_fee_gwei: u64,
+    pub min_profit_threshold: u64,
+    pub profit_scaling_percent: u64,
+}
 
-/// Use monadNewHeads (Monad-native) vs standard newHeads
-/// Set to false for providers that don't support monadNewHeads
-pub const USE_MONAD_NEW_HEADS: bool = true;
+#[derive(Debug, Deserialize)]
+pub struct TransactionConfig {
+    pub gas_limit: u64,
+    #[serde(default)]
+    pub cooldown_blocks: u64,
+}
 
-/// Primary HTTPS endpoint for RPC calls (calculateProfit, nonce, etc.)
-// pub const PRIMARY_HTTPS_ENV: &str = "QUICKNODE_HTTPS";
-pub const PRIMARY_HTTPS_ENV: &str = "CHAINSTACK_HTTP";
-// pub const PRIMARY_HTTPS_ENV: &str = "DRPC_HTTPS";
-// pub const PRIMARY_HTTPS_ENV: &str = "INFURA_HTTPS_API";
-// pub const PRIMARY_HTTPS_ENV: &str = "ALCHEMY_HTTPS_API";
-// pub const PRIMARY_HTTPS_ENV: &str = "ANKR_HTTPS";
-// pub const PRIMARY_HTTPS_ENV: &str = "DRPC_HTTPS";
+#[derive(Debug, Deserialize, Clone)]
+pub struct BroadcastEndpoint {
+    pub env: String,
+    pub name: String,
+}
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct BotConfig {
+    pub address: String,
+    pub name: String,
+}
 
-/// Broadcast endpoints - transactions are sent to ALL of these in parallel
-/// Format: (env_var_name, display_name)
-pub const BROADCAST_ENDPOINTS: &[(&str, &str)] = &[
-    ("QUICKNODE_HTTPS", "QuickNode"),
-    ("INFURA_HTTPS_API", "Infura"),
-    ("ALCHEMY_HTTPS_API", "Alchemy"),
-    ("ANKR_HTTPS", "Ankr"),
-    ("DRPC_HTTPS", "dRPC"),
-    ("CHAINSTACK_HTTP", "Chainstack"),
-];
+#[derive(Debug, Deserialize)]
+pub struct LoggingConfig {
+    pub tx_log_file: String,
+}
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PRIORITY FEE CONFIGURATION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Base priority fee in gwei (applied to all transactions)
-pub const BASE_PRIORITY_GWEI: u128 = 30;
-
-/// Maximum priority fee cap in gwei (prevents overpaying)
-pub const MAX_PRIORITY_GWEI: u128 = 180;
-
-/// Minimum profit threshold (in 18 decimals) before adding profit-based priority
-/// 0.05 = 5 cents threshold
-pub const MIN_PROFIT_THRESHOLD: u128 = 100_000_000_000_000_000;
-
-/// Percentage of profit to add to priority fee (e.g., 2 = 2%)
-pub const PROFIT_SCALING_PERCENT: u128 = 2;
-
-/// Base max fee per gas in gwei (added to priority fee for max_fee_per_gas)
-pub const BASE_MAX_FEE_GWEI: u128 = 100;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TRANSACTION CONFIGURATION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Gas limit for execute() transactions
-pub const GAS_LIMIT: u64 = 3_200_000;
-
-/// Cooldown: Skip checking a bot for N blocks after it broadcasts
-/// Set to 0 to disable (useful for high volatility periods)
-pub const COOLDOWN_BLOCKS: u64 = 0;
+fn default_true() -> bool {
+    true
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BOT CONFIGURATION
+// GLOBAL CONFIG (Loaded once at startup)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Bot contract addresses and names
-/// Format: (address, name)  
-/// Comment out bots to disable them
-pub const BOTS: &[(&str, &str)] = &[
-    // ("0xcba9708114edbc3eba7e85c941cdaec75ace63e2", "USDC-v6"),
-    // ("0x602410f69c9ec48cfcb3c5030d46a93f0180bc6b", "AUSD-v6"),
-    ("0xFF9aB730d101e5634eE133C0436E247f3520FefF", "USDC-v7"),
-    ("0x1E45ba2e6d56282a1F0d6A9E2147E5199eF0B913", "AUSD-v7"),
-    // ("0xbee8762143c3a9f26831981d4871862fa7134d01", "Triangle-v3"),
-];
+static CONFIG: OnceLock<Config> = OnceLock::new();
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// LOGGING CONFIGURATION  
-// ═══════════════════════════════════════════════════════════════════════════════
+/// Load config from config.toml. Call once at startup.
+pub fn load_config() -> anyhow::Result<&'static Config> {
+    let config_path = "config.toml";
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", config_path, e))?;
+    
+    let config: Config = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", config_path, e))?;
+    
+    // Store in global. If already set (shouldn't happen), just return the existing one.
+    let _ = CONFIG.set(config);
+    
+    Ok(CONFIG.get().unwrap())
+}
 
-/// Transaction log file path
-pub const TX_LOG_FILE: &str = "transactions_monad.md";
+/// Get already loaded config. Panics if not yet loaded.
+pub fn config() -> &'static Config {
+    CONFIG.get().expect("Config not loaded. Call load_config() first.")
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Convert gwei to wei
+#[inline(always)]
 pub const fn gwei_to_wei(gwei: u128) -> u128 {
     gwei * 1_000_000_000
 }
 
 /// Calculate dynamic priority fee based on profit
-pub fn calculate_priority_fee(profit_wei: u128) -> u128 {
-    let base = gwei_to_wei(BASE_PRIORITY_GWEI);
-    let max = gwei_to_wei(MAX_PRIORITY_GWEI);
+pub fn calculate_priority_fee(cfg: &Config, profit_wei: u128) -> u128 {
+    let base = gwei_to_wei(cfg.fees.base_priority_gwei as u128);
+    let max = gwei_to_wei(cfg.fees.max_priority_gwei as u128);
     
-    if profit_wei <= MIN_PROFIT_THRESHOLD {
+    if profit_wei <= cfg.fees.min_profit_threshold as u128 {
         return base;
     }
     
     // Calculate priority fee: (profit * scaling%) / gas_limit
-    let profit_as_gas_price = profit_wei * PROFIT_SCALING_PERCENT / 100 / (GAS_LIMIT as u128);
+    let profit_as_gas_price = profit_wei * (cfg.fees.profit_scaling_percent as u128) / 100 / (cfg.transaction.gas_limit as u128);
     
     std::cmp::min(base + profit_as_gas_price, max)
 }
 
 /// Parse bot addresses from config
-pub fn get_bot_addresses() -> Vec<(Address, &'static str)> {
-    BOTS.iter()
-        .filter_map(|(addr, name)| {
-            Address::from_str(addr).ok().map(|a| (a, *name))
+pub fn get_bot_addresses(cfg: &Config) -> Vec<(Address, String)> {
+    cfg.bots
+        .iter()
+        .filter_map(|bot| {
+            Address::from_str(&bot.address).ok().map(|a| (a, bot.name.clone()))
         })
         .collect()
 }
