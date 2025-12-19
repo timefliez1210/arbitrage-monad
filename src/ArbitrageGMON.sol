@@ -3,6 +3,9 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IOrderBook} from "@kuru/contracts/interfaces/IOrderBook.sol";
+import {
+    FixedPointMathLib
+} from "@kuru/contracts/libraries/FixedPointMathLib.sol";
 
 /// @title Uniswap V3 Pool Interface (minimal)
 interface IUniswapV3Pool {
@@ -42,7 +45,15 @@ interface IWMON {
 
 /// @title ArbitrageGMON - MON/gMON Arbitrage using Uniswap V3 + Kuru
 /// @notice Arbitrages price discrepancies between V3 pool (WMON/gMON) and Kuru orderbook (MON/gMON)
-/// @dev Uses V3's swap callback pattern for flash-style execution
+/// @dev Uses V3's swap callback pattern for flash-style execution (no own capital needed)
+///
+/// PRICE CONVENTIONS:
+/// - V3 Pool (WMON/gMON): sqrtPriceX96 gives price of token1 (gMON) in terms of token0 (WMON)
+///   So V3 price = gMON per WMON
+/// - Kuru OB (MON/gMON): bestBidAsk returns price in MON per gMON
+///   Bid = price to sell gMON for MON, Ask = price to buy gMON with MON
+/// - Since WMON = MON, we need to INVERT V3 price to compare with Kuru
+///   V3 inverted = MON per gMON = 1e36 / v3Price
 contract ArbitrageGMON {
     // ═══════════════════════════════════════════════════════════════════════════
     // CONSTANTS
@@ -64,13 +75,12 @@ contract ArbitrageGMON {
     IOrderBook public constant KURU_OB =
         IOrderBook(0x1CA0F16a316c3EE0Ff3CEC5382cAaD5648Ea512D);
 
-    /// @notice Price scale factor for Kuru (1e18)
+    /// @notice Price scale factor (1e18)
     uint256 public constant PRICE_SCALE = 1e18;
+    uint256 constant BASE_MULTIPLIER = 1e18;
 
-    /// @notice Min sqrt price for V3 (prevents revert on extreme swaps)
+    /// @notice Min/Max sqrt price for V3
     uint160 public constant MIN_SQRT_RATIO = 4295128739;
-
-    /// @notice Max sqrt price for V3
     uint160 public constant MAX_SQRT_RATIO =
         1461446703485210103287273052203988822378723970342;
 
@@ -79,7 +89,6 @@ contract ArbitrageGMON {
     // ═══════════════════════════════════════════════════════════════════════════
 
     address public immutable owner;
-    address public immutable profitRecipient;
 
     /// @notice Kuru market params (cached at deploy)
     uint32 public immutable pricePrecision;
@@ -89,9 +98,8 @@ contract ArbitrageGMON {
     // CONSTRUCTOR
     // ═══════════════════════════════════════════════════════════════════════════
 
-    constructor(address _profitRecipient) {
-        owner = msg.sender;
-        profitRecipient = _profitRecipient;
+    constructor(address _owner) {
+        owner = _owner;
 
         // Cache Kuru market params
         (uint32 pp, uint96 sp, , , , , , , , , ) = KURU_OB.getMarketParams();
@@ -109,38 +117,58 @@ contract ArbitrageGMON {
     // EXTERNAL FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Check if profitable arbitrage exists
-    /// @return profitable True if profitable opportunity exists
-    /// @return expectedProfit Estimated profit in MON (18 decimals)
+    /// @notice Lightweight profit check for off-chain keepers
+    /// @dev Uses 10 tick depth for speed. Returns only essential data.
     function keeperProfit()
         external
         view
         returns (bool profitable, uint256 expectedProfit)
     {
-        // Get V3 price (sqrtPriceX96)
         (uint160 sqrtPriceX96, , , , , , ) = V3_POOL.slot0();
 
-        // Convert to 1e18 price (gMON per WMON)
-        // price = (sqrtPriceX96 / 2^96)^2 = sqrtPriceX96^2 / 2^192
-        uint256 v3Price = _sqrtPriceToPrice(sqrtPriceX96);
+        // V3 price = gMON per WMON, but Kuru uses MON per gMON
+        // Invert: v3PriceInverted = 1e36 / v3Price = MON per gMON
+        uint256 v3PriceRaw = _sqrtPriceToPrice(sqrtPriceX96);
+        if (v3PriceRaw == 0) return (false, 0);
+        uint256 v3Price = (1e36) / v3PriceRaw; // Now in MON/gMON like Kuru
 
-        // Get Kuru best bid/ask (already in 1e18 scale!)
-        // Bid = price to sell gMON for MON
-        // Ask = price to buy gMON with MON
         (uint256 kuruBid, uint256 kuruAsk) = KURU_OB.bestBidAsk();
 
-        // Check for arbitrage:
-        // Forward: V3 price < Kuru bid → Buy gMON on V3, sell on Kuru
-        // Reverse: V3 price > Kuru ask → Buy gMON on Kuru, sell on V3
+        // V3 fee 0.3% + Kuru fee 0.02% = ~32 bps
+        uint256 fee = (v3Price * 32) / 10000;
 
-        if (v3Price > 0 && kuruBid > v3Price) {
-            // Forward arb: V3 → Kuru
-            expectedProfit = ((kuruBid - v3Price) * 1e18) / v3Price; // % profit scaled
-            profitable = expectedProfit > 5e15; // > 0.5% threshold
-        } else if (v3Price > 0 && v3Price > kuruAsk && kuruAsk > 0) {
-            // Reverse arb: Kuru → V3
-            expectedProfit = ((v3Price - kuruAsk) * 1e18) / kuruAsk;
-            profitable = expectedProfit > 5e15;
+        // Forward: V3 price < Kuru bid → Buy gMON on V3 (cheap), sell on Kuru (expensive)
+        // When V3 gives more gMON per MON than Kuru bid price
+        if (v3Price + fee < kuruBid) {
+            uint256 kuruSize = getAggregatedBidSize(10, v3Price + fee);
+            if (kuruSize > 0) {
+                uint256 effectiveSpread = ((kuruBid - v3Price) * 6) / 10;
+                uint256 executeMargin = (kuruBid * 20) / 10000;
+                if (effectiveSpread > fee + executeMargin) {
+                    expectedProfit =
+                        ((effectiveSpread - fee - executeMargin) * kuruSize) /
+                        1e18;
+                    if (expectedProfit > 15e15) {
+                        profitable = true;
+                    }
+                }
+            }
+        }
+        // Reverse: V3 price > Kuru ask → Buy gMON on Kuru (cheap), sell on V3 (expensive)
+        else if (v3Price > kuruAsk + fee && kuruAsk > 0) {
+            (uint256 kuruSize, ) = getAggregatedAskSize(10, v3Price - fee);
+            if (kuruSize > 0) {
+                uint256 effectiveSpread = ((v3Price - kuruAsk) * 6) / 10;
+                uint256 executeMargin = (kuruAsk * 37) / 10000;
+                if (effectiveSpread > fee + executeMargin) {
+                    expectedProfit =
+                        ((effectiveSpread - fee - executeMargin) * kuruSize) /
+                        v3Price;
+                    if (expectedProfit > 0.75 ether) {
+                        profitable = true;
+                    }
+                }
+            }
         }
     }
 
@@ -149,67 +177,90 @@ contract ArbitrageGMON {
     function execute() external returns (bool success) {
         require(msg.sender == owner, "Not owner");
 
-        // Get prices
         (uint160 sqrtPriceX96, , , , , , ) = V3_POOL.slot0();
-        uint256 v3Price = _sqrtPriceToPrice(sqrtPriceX96);
+
+        // V3 price inverted to match Kuru's MON/gMON convention
+        uint256 v3PriceRaw = _sqrtPriceToPrice(sqrtPriceX96);
+        if (v3PriceRaw == 0) return false;
+        uint256 v3Price = (1e36) / v3PriceRaw;
+
         (uint256 bestBid, uint256 bestAsk) = KURU_OB.bestBidAsk();
 
-        // Kuru prices are already in 1e18 scale (MON per gMON)
+        // V3 fee 0.3% + Kuru fee 0.02% = ~32 bps
+        uint256 fee = (v3Price * 32) / 10000;
 
-        if (bestBid > v3Price) {
-            // Forward: Buy gMON on V3, sell on Kuru for MON
-            success = _executeForward(sqrtPriceX96);
-        } else if (v3Price > bestAsk && bestAsk > 0) {
-            // Reverse: Buy gMON on Kuru with MON, sell on V3 for WMON
-            success = _executeReverse(sqrtPriceX96);
+        bool zeroForOne;
+        uint256 kuruVolWei;
+        uint160 sqrtLimit;
+        uint256 maxQuoteSpend;
+
+        if (v3Price + fee < bestBid) {
+            // Forward: Buy gMON on V3 (low), sell on Kuru (high)
+            // V3: sell WMON (token0) for gMON (token1) → zeroForOne = true
+            zeroForOne = true;
+
+            kuruVolWei = getAggregatedBidSize(50, v3Price + fee);
+
+            // Calculate sqrtPriceLimit
+            // We're buying gMON, which decreases the V3 price (gMON/WMON)
+            // Stop if inverted price (MON/gMON) >= bestBid - margin
+            uint256 safeBid = (bestBid * 9980) / 10000;
+            // Invert back: v3PriceRaw limit = 1e36 / safeBid
+            uint256 v3PriceLimit = (1e36) / safeBid;
+            sqrtLimit = _priceToSqrtPrice(v3PriceLimit);
+
+            // For zeroForOne=true, sqrtLimit must be < current
+            if (sqrtLimit >= sqrtPriceX96) return false;
+        } else if (v3Price > bestAsk + fee && bestAsk > 0) {
+            // Reverse: Buy gMON on Kuru (low), sell on V3 (high)
+            // V3: sell gMON (token1) for WMON (token0) → zeroForOne = false
+            zeroForOne = false;
+
+            (kuruVolWei, maxQuoteSpend) = getAggregatedAskSize(
+                50,
+                v3Price - fee
+            );
+            maxQuoteSpend = (maxQuoteSpend * 9970) / 10000; // 0.3% buffer
+
+            // Calculate sqrtPriceLimit
+            // We're selling gMON, which increases the V3 price (gMON/WMON)
+            // Stop if inverted price (MON/gMON) <= bestAsk + margin
+            uint256 safeAsk = (bestAsk * 10007) / 10000;
+            uint256 v3PriceLimit = (1e36) / safeAsk;
+            sqrtLimit = _priceToSqrtPrice(v3PriceLimit);
+
+            // For zeroForOne=false, sqrtLimit must be > current
+            if (sqrtLimit <= sqrtPriceX96) return false;
+        } else {
+            return false;
         }
 
-        // Sweep profits
+        if (kuruVolWei == 0) return false;
+
+        // Execute via V3 swap callback
+        bytes memory data = abi.encode(zeroForOne, kuruVolWei, maxQuoteSpend);
+
+        if (zeroForOne) {
+            // Forward: exactOutput gMON (negative = exact output)
+            int256 amountSpecified = -int256(kuruVolWei);
+            V3_POOL.swap(address(this), true, amountSpecified, sqrtLimit, data);
+        } else {
+            // Reverse: exactOutput WMON (we want WMON to unwrap to MON for Kuru)
+            int256 amountSpecified = -int256(maxQuoteSpend);
+            V3_POOL.swap(
+                address(this),
+                false,
+                amountSpecified,
+                sqrtLimit,
+                data
+            );
+        }
+
+        success = true;
         _sweepProfits();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // INTERNAL FUNCTIONS
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// @notice Forward arb: V3 flash → Kuru
-    /// @dev Flash borrow gMON from V3, sell on Kuru for MON, wrap to WMON, pay V3
-    function _executeForward(uint160) internal returns (bool) {
-        // Determine trade size - use a reasonable amount based on liquidity
-        // For flash, we request gMON output, pay WMON in callback
-        // amountSpecified < 0 means "give me exactly X output tokens"
-        int256 amountSpecified = -1 ether; // Request 1 gMON (adjust based on liquidity)
-
-        V3_POOL.swap(
-            address(this),
-            true, // zeroForOne: we're buying gMON with WMON
-            amountSpecified, // negative = exact output
-            MIN_SQRT_RATIO + 1,
-            abi.encode(true, uint256(0)) // Forward flag, no extra data
-        );
-
-        return true;
-    }
-
-    /// @notice Reverse arb: Kuru flash → V3
-    /// @dev Flash borrow WMON from V3, unwrap to MON, buy gMON on Kuru, pay V3 with gMON
-    function _executeReverse(uint160) internal returns (bool) {
-        // Request WMON output, pay gMON in callback
-        int256 amountSpecified = -1 ether; // Request 1 WMON
-
-        V3_POOL.swap(
-            address(this),
-            false, // zeroForOne=false: we're buying WMON with gMON
-            amountSpecified,
-            MAX_SQRT_RATIO - 1,
-            abi.encode(false, uint256(0)) // Reverse flag
-        );
-
-        return true;
-    }
-
     /// @notice V3 swap callback - THIS IS WHERE THE ARB HAPPENS
-    /// @dev V3 has already given us the output tokens, now we do the arb and pay back
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
@@ -217,7 +268,7 @@ contract ArbitrageGMON {
     ) external {
         require(msg.sender == address(V3_POOL), "Invalid callback");
 
-        (bool isForward, ) = abi.decode(data, (bool, uint256));
+        (bool isForward, , ) = abi.decode(data, (bool, uint256, uint256));
 
         if (isForward) {
             // FORWARD: We received gMON (amount1Delta < 0), must pay WMON (amount0Delta > 0)
@@ -225,24 +276,23 @@ contract ArbitrageGMON {
             uint256 wmonOwed = uint256(amount0Delta);
 
             // 1. Sell gMON on Kuru for MON
-            uint96 sellSize = uint96(
-                (gmonReceived / sizePrecision) * sizePrecision
-            );
+            uint96 sellSize = uint96((gmonReceived * sizePrecision) / 1e18);
             if (sellSize > 0) {
+                GMON.approve(address(KURU_OB), gmonReceived);
                 KURU_OB.placeAndExecuteMarketSell(sellSize, 0, false, false);
             }
 
-            // 2. We now have MON - wrap to WMON
+            // 2. Wrap MON to WMON
             uint256 monBalance = address(this).balance;
-            if (monBalance > 0) {
-                WMON.deposit{value: monBalance}();
-            }
+            require(monBalance > 0, "No MON from Kuru");
+            WMON.deposit{value: monBalance}();
 
             // 3. Pay V3 the WMON we owe
+            require(
+                WMON.balanceOf(address(this)) >= wmonOwed,
+                "Insufficient WMON"
+            );
             WMON.transfer(msg.sender, wmonOwed);
-
-            // Profit = WMON balance - wmonOwed (what we had before paying)
-            // Any excess WMON is profit!
         } else {
             // REVERSE: We received WMON (amount0Delta < 0), must pay gMON (amount1Delta > 0)
             uint256 wmonReceived = uint256(-amount0Delta);
@@ -253,69 +303,149 @@ contract ArbitrageGMON {
 
             // 2. Buy gMON on Kuru with MON
             uint256 monBalance = address(this).balance;
+            uint96 quoteInput = uint96((monBalance * pricePrecision) / 1e18);
             KURU_OB.placeAndExecuteMarketBuy{value: monBalance}(
-                uint96(monBalance),
+                quoteInput,
                 0,
                 false,
                 false
             );
 
             // 3. Pay V3 the gMON we owe
+            uint256 gmonBalance = GMON.balanceOf(address(this));
+            require(gmonBalance >= gmonOwed, "Insufficient gMON");
             GMON.transfer(msg.sender, gmonOwed);
-
-            // Profit = gMON balance - gmonOwed (any excess gMON is profit!)
         }
     }
 
-    /// @notice Convert sqrtPriceX96 to 1e18 price
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Convert sqrtPriceX96 to price (gMON per WMON, 1e18 scale)
     function _sqrtPriceToPrice(
         uint160 sqrtPriceX96
     ) internal pure returns (uint256) {
-        // price = (sqrtPriceX96 / 2^96)^2 * 1e18
-        // = sqrtPriceX96^2 * 1e18 / 2^192
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         return (sqrtPrice * sqrtPrice * PRICE_SCALE) >> 192;
     }
 
-    /// @notice Sweep profits to recipient (keeps original currency)
+    /// @notice Convert price (1e18) to sqrtPriceX96
+    function _priceToSqrtPrice(
+        uint256 price1e18
+    ) internal pure returns (uint160) {
+        uint256 root = FixedPointMathLib.sqrt(price1e18);
+        return uint160((root << 96) / 1e9);
+    }
+
     function _sweepProfits() internal {
-        // Sweep WMON profits (keep 0.1 WMON for future trades)
         uint256 wmonBalance = WMON.balanceOf(address(this));
-        if (wmonBalance > 0.1 ether) {
-            WMON.transfer(profitRecipient, wmonBalance - 0.1 ether);
-        }
+        if (wmonBalance > 0) WMON.transfer(owner, wmonBalance);
 
-        // Sweep MON profits (keep 1 MON for gas)
         uint256 monBalance = address(this).balance;
-        if (monBalance > 1 ether) {
-            payable(profitRecipient).transfer(monBalance - 1 ether);
+        if (monBalance > 0) payable(owner).transfer(monBalance);
+
+        uint256 gmonBalance = GMON.balanceOf(address(this));
+        if (gmonBalance > 0) GMON.transfer(owner, gmonBalance);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ORDERBOOK HELPERS (matches ArbitrageAUSD pattern)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function getAggregatedBidSize(
+        uint32 ticksBid,
+        uint256 minPrice
+    ) public view returns (uint256 totalSizeWei) {
+        uint256 totalSizeRaw;
+        // Convert 1e18 price to raw pricePrecision
+        uint256 minPriceRaw = (minPrice * pricePrecision) / 1e18;
+
+        bytes memory data = KURU_OB.getL2Book(ticksBid, 0);
+
+        assembly {
+            let ptr := add(data, 64)
+            for {
+                let i := 0
+            } lt(i, ticksBid) {
+                i := add(i, 1)
+            } {
+                let price := mload(ptr)
+                if iszero(price) {
+                    break
+                }
+                if lt(price, minPriceRaw) {
+                    break
+                }
+
+                let size := mload(add(ptr, 32))
+                if gt(size, 1000000000000000000000000000000) {
+                    size := shr(160, size)
+                }
+                totalSizeRaw := add(totalSizeRaw, size)
+                ptr := add(ptr, 64)
+            }
         }
 
-        // Sweep gMON profits (keep 0.1 gMON for future trades)
-        uint256 gmonBalance = GMON.balanceOf(address(this));
-        if (gmonBalance > 0.1 ether) {
-            GMON.transfer(profitRecipient, gmonBalance - 0.1 ether);
+        totalSizeWei = (totalSizeRaw * BASE_MULTIPLIER) / sizePrecision;
+    }
+
+    function getAggregatedAskSize(
+        uint32 ticksAsk,
+        uint256 maxPrice
+    ) public view returns (uint256 totalSizeWei, uint256 totalCostMON) {
+        uint256 totalSizeRaw;
+        // Convert 1e18 price to raw pricePrecision
+        uint256 maxPriceRaw = (maxPrice * pricePrecision) / 1e18;
+
+        bytes memory data = KURU_OB.getL2Book(0, ticksAsk);
+
+        assembly {
+            let ptr := add(data, 96) // Skip bid delimiter
+            for {
+                let i := 0
+            } lt(i, ticksAsk) {
+                i := add(i, 1)
+            } {
+                let price := mload(ptr)
+                if iszero(price) {
+                    break
+                }
+                if gt(price, maxPriceRaw) {
+                    break
+                }
+
+                let size := mload(add(ptr, 32))
+                if gt(size, 1000000000000000000000000000000) {
+                    size := shr(160, size)
+                }
+                totalSizeRaw := add(totalSizeRaw, size)
+
+                // Cost in MON (quote) = size * price / pricePrecision
+                let costRaw := mul(size, price)
+                let cost := div(costRaw, 1000000) // pricePrecision = 1e6 for gMON
+                totalCostMON := add(totalCostMON, cost)
+
+                ptr := add(ptr, 64)
+            }
         }
+
+        totalSizeWei = (totalSizeRaw * BASE_MULTIPLIER) / sizePrecision;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // ADMIN
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// @notice Emergency withdraw
     function emergencyWithdraw() external {
         require(msg.sender == owner, "Not owner");
-
         uint256 wmonBalance = WMON.balanceOf(address(this));
         if (wmonBalance > 0) WMON.transfer(owner, wmonBalance);
-
         uint256 gmonBalance = GMON.balanceOf(address(this));
         if (gmonBalance > 0) GMON.transfer(owner, gmonBalance);
-
         uint256 monBalance = address(this).balance;
         if (monBalance > 0) payable(owner).transfer(monBalance);
     }
 
-    /// @notice Receive native MON
     receive() external payable {}
 }

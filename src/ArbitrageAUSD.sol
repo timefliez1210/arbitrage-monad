@@ -149,12 +149,20 @@ contract ArbitrageAUSD is IUnlockCallback {
         // Forward check: Uni price < Kuru bid
         if (price1e18 < bestBid && bestBid > price1e18 + fee) {
             uint256 kuruSize = getAggregatedBidSize(10, price1e18 + fee); // 10 ticks only!
-            if (kuruSize > 200e18) {
-                expectedProfit =
-                    ((bestBid - (price1e18 + fee)) * kuruSize) /
-                    1e18;
-                if (expectedProfit > 3e16) {
-                    profitable = true;
+            if (kuruSize > 0) {
+                // Use 60% of spread (midpoint + 10% skew towards best price)
+                // effectiveSpread = (bestBid - price1e18) * 0.6
+                uint256 effectiveSpread = ((bestBid - price1e18) * 8) / 10;
+                // Subtract execute() safety margin: 20bps price limit buffer
+                uint256 executeMargin = (bestBid * 20) / 10000;
+                if (effectiveSpread > fee + executeMargin) {
+                    expectedProfit =
+                        ((effectiveSpread - fee - executeMargin) * kuruSize) /
+                        1e18;
+                    // Threshold: 0.03 AUSD (3 cents)
+                    if (expectedProfit > 15e15) {
+                        profitable = true;
+                    }
                 }
             }
         }
@@ -163,12 +171,20 @@ contract ArbitrageAUSD is IUnlockCallback {
             price1e18 > bestAsk && bestAsk > 0 && bestAsk < price1e18 - fee
         ) {
             (uint256 kuruSize, ) = getAggregatedAskSize(10, price1e18 - fee); // 10 ticks only!
-            if (kuruSize > 200e18) {
-                expectedProfit =
-                    ((price1e18 - fee - bestAsk) * kuruSize) /
-                    price1e18;
-                if (expectedProfit > 1 ether) {
-                    profitable = true;
+            if (kuruSize > 0) {
+                // Use 60% of spread (midpoint + 10% skew towards best price)
+                // effectiveSpread = (price1e18 - bestAsk) * 0.6
+                uint256 effectiveSpread = ((price1e18 - bestAsk) * 8) / 10;
+                // Subtract execute() safety margins: 7bps price + 30bps quantity = 37bps
+                uint256 executeMargin = (bestAsk * 37) / 10000;
+                if (effectiveSpread > fee + executeMargin) {
+                    expectedProfit =
+                        ((effectiveSpread - fee - executeMargin) * kuruSize) /
+                        price1e18;
+                    // Threshold: 0.75 MON
+                    if (expectedProfit > 0.75 ether) {
+                        profitable = true;
+                    }
                 }
             }
         }
@@ -214,7 +230,7 @@ contract ArbitrageAUSD is IUnlockCallback {
                 minPrice
             );
 
-            if (bestBidSizeKuru < 200e18) {
+            if (bestBidSizeKuru == 0) {
                 return (
                     false,
                     false,
@@ -279,7 +295,7 @@ contract ArbitrageAUSD is IUnlockCallback {
                 maxPrice
             );
 
-            if (bestAskSizeKuru < 200e18) {
+            if (bestAskSizeKuru == 0) {
                 return (
                     false,
                     true,

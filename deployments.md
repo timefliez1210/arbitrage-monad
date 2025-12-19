@@ -102,8 +102,14 @@ WBTC address 0x0555E30da8f98308EdB960aa94C0Db47230d2B9c
 - Fix: Quantity buffer 0.3% → 0.4%
 - Still reverted on partial fills due to sqrtPriceLimit
 
-### Price Limit Fix v7 (2024-12-15) - ACTIVE
+### Price Limit Fix v7 (2024-12-15) - SUPERSEDED
 - **ArbitrageAUSD**: `0x602410f69c9ec48cfcb3c5030d46a93f0180bc6b`
 - **ArbitrageUSDC**: `0xcba9708114edbc3eba7e85c941cdaec75ace63e2`
+- Fix: Price limit margin 0.1% → 0.2% (9980/10000)
+- Addresses partial fill precision reverts
+
+### Price Limit Fix v7 (2024-12-15) - ACTIVE
+- **ArbitrageAUSD**: `0x1E45ba2e6d56282a1F0d6A9E2147E5199eF0B913`
+- **ArbitrageUSDC**: `0xFF9aB730d101e5634eE133C0436E247f3520FefF`
 - Fix: Price limit margin 0.1% → 0.2% (9980/10000)
 - Addresses partial fill precision reverts

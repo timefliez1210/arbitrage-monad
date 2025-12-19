@@ -66,7 +66,7 @@ base_max_fee_gwei = 100
 # Minimum profit threshold (in wei, 1e17 = 0.1 token) before adding profit-based priority
 min_profit_threshold = 100_000_000_000_000_000
 # Percentage of profit to add to priority fee (e.g., 10 = 10%)
-profit_scaling_percent = 10
+profit_scaling_percent = 30
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRANSACTION CONFIGURATION
@@ -85,16 +85,13 @@ cooldown_blocks = 1
 # Comment out or remove bots to disable them
 
 [[bots]]
-address = "0x11a4cadab2662fd611052275ba4b0624f8291e95"
+address = "0x4A0F6430280fbfB8DEd1ED0F4bf88b402E496081"
 name = "USDC-v8"
 
 [[bots]]
-address = "0xc52f4d116ef28ba73808cddd87a0b9d81d0fd996"
+address = "0x10A4fc74b8D5dD2fd2f64345ADc7120f21CE7002"
 name = "AUSD-v8"
 
-# [[bots]]
-# address = "0xbee8762143c3a9f26831981d4871862fa7134d01"
-# name = "Triangle-v3"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING CONFIGURATION
