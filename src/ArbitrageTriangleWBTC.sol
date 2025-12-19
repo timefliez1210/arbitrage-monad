@@ -25,15 +25,14 @@ import {
 
 /// @title ArbitrageTriangleWBTC
 /// @notice Triangular arbitrage across MON/WBTC, AUSD/WBTC, and MON/AUSD pools
-/// @dev Uses V4 flash accounting with EXACT INPUT swaps for correct decimal handling
+/// @dev Uses V4 flash accounting with EXACT INPUT swaps
 ///
 /// Pool Configuration (all fee=500, tickSpacing=1):
 /// - MON/WBTC: currency0=MON(18), currency1=WBTC(8)
-/// - AUSD/WBTC: currency0=AUSD(6), currency1=WBTC(8)
+/// - AUSD/WBTC: currency0=AUSD(6), currency1=WBTC(8) <- BOTTLENECK (lowest liquidity)
 /// - MON/AUSD: currency0=MON(18), currency1=AUSD(6)
 ///
-/// Forward path: MON → WBTC → AUSD → MON (profitable when priceMonWbtc/priceAusdWbtc/priceMonAusd > 1)
-/// Reverse path: MON → AUSD → WBTC → MON (profitable when priceMonAusd*priceAusdWbtc/priceMonWbtc > 1)
+/// Trade sizing: Query AUSD/WBTC liquidity, estimate max trade assuming even distribution
 contract ArbitrageTriangleWBTC is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -63,6 +62,16 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
     uint8 constant MON_DECIMALS = 18;
     uint8 constant WBTC_DECIMALS = 8;
     uint8 constant AUSD_DECIMALS = 6;
+
+    // Trade sizing parameters
+    // Max % of bottleneck liquidity to use (10% = 1000 / 10000)
+    uint256 constant LIQUIDITY_FRACTION = 1000; // 10%
+    uint256 constant LIQUIDITY_DENOMINATOR = 10000;
+
+    // Minimum trade size in MON (to cover gas)
+    uint256 constant MIN_TRADE_SIZE = 1.5 ether; // 1.5 MON
+    // Maximum trade size cap
+    uint256 constant MAX_TRADE_SIZE = 100000 ether; // 100k MON
 
     // Owner for profit
     address public immutable owner;
@@ -119,8 +128,6 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
     }
 
     /// @notice Convert sqrtPriceX96 to price with 1e18 precision
-    /// @dev price = (sqrtPrice^2 * 10^(18 + decimals0 - decimals1)) / 2^192
-    /// This gives: price of token1 in terms of token0 (how many token0 for 1 token1)
     function sqrtPriceToPrice(
         uint160 sqrtPriceX96,
         uint8 decimals0,
@@ -131,10 +138,67 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
         return FullMath.mulDiv(sqrtPrice * sqrtPrice, scaleFactor, 1 << 192);
     }
 
+    // ============ LIQUIDITY ESTIMATION ============
+
+    /// @notice Get bottleneck pool liquidity and estimate max trade size
+    /// @dev Queries AUSD/WBTC pool (lowest liquidity), converts to MON terms
+    function estimateTradeSize() public view returns (uint256 tradeSize) {
+        // Get AUSD/WBTC pool liquidity (this is in sqrt(AUSD * WBTC) units)
+        PoolId bottleneckId = getPoolKeyAusdWbtc().toId();
+        uint128 liquidity = PM.getLiquidity(bottleneckId);
+
+        if (liquidity == 0) {
+            return MIN_TRADE_SIZE;
+        }
+
+        // Get prices to convert liquidity to MON terms
+        uint256 priceMonWbtc = sqrtPriceToPrice(
+            getSqrtPrice(getPoolKeyMonWbtc()),
+            MON_DECIMALS,
+            WBTC_DECIMALS
+        );
+        uint256 priceAusdWbtc = sqrtPriceToPrice(
+            getSqrtPrice(getPoolKeyAusdWbtc()),
+            AUSD_DECIMALS,
+            WBTC_DECIMALS
+        );
+
+        if (priceMonWbtc == 0 || priceAusdWbtc == 0) {
+            return MIN_TRADE_SIZE;
+        }
+
+        // Approximate tradeable WBTC from liquidity
+        // In Uniswap V3/V4, liquidity L relates to amounts via:
+        // deltaX ≈ L * deltaPrice / price (very rough approximation)
+        // For simplicity, assume we can trade ~L / 1e6 WBTC safely
+        // This is conservative and depends on tick range
+        uint256 tradeableWbtc = uint256(liquidity) / 1e6;
+
+        // Convert WBTC to MON: MON = WBTC / priceMonWbtc * 1e18
+        // priceMonWbtc = WBTC per MON, so MON = WBTC * 1e18 / priceMonWbtc
+        uint256 tradeableMonFromWbtc = FullMath.mulDiv(
+            tradeableWbtc * 1e10, // Scale WBTC(8) to 18 decimals
+            1e18,
+            priceMonWbtc
+        );
+
+        // Take fraction of tradeable amount
+        tradeSize =
+            (tradeableMonFromWbtc * LIQUIDITY_FRACTION) /
+            LIQUIDITY_DENOMINATOR;
+
+        // Clamp to bounds
+        if (tradeSize < MIN_TRADE_SIZE) {
+            tradeSize = MIN_TRADE_SIZE;
+        }
+        if (tradeSize > MAX_TRADE_SIZE) {
+            tradeSize = MAX_TRADE_SIZE;
+        }
+    }
+
     // ============ KEEPER PROFIT CHECK ============
 
     /// @notice Lightweight profit check for off-chain keeper
-    /// @dev Only fetches prices, no liquidity queries for speed
     function keeperProfit()
         external
         view
@@ -148,10 +212,6 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             return (false, 0);
         }
 
-        // Convert to prices (1e18 precision)
-        // priceMonWbtc = WBTC per MON (token1/token0)
-        // priceAusdWbtc = WBTC per AUSD
-        // priceMonAusd = AUSD per MON
         uint256 priceMonWbtc = sqrtPriceToPrice(
             sqrtMonWbtc,
             MON_DECIMALS,
@@ -168,12 +228,12 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             AUSD_DECIMALS
         );
 
-        // Total fees for 3 swaps: 3 * 0.05% = 0.15% = 15 bps
-        uint256 totalFeeBps = 15;
+        // Total fees for 3 swaps: 3 * 0.05% = 0.15%
+        // Plus slippage buffer: ~0.5% total = 50 bps
+        uint256 totalFeeBps = 50;
         uint256 minOutput = (1e18 * (10000 + totalFeeBps)) / 10000;
 
         // Forward path: MON → WBTC → AUSD → MON
-        // 1 MON → priceMonWbtc WBTC → (priceMonWbtc/priceAusdWbtc) AUSD → (priceMonWbtc/priceAusdWbtc/priceMonAusd) MON
         if (priceMonWbtc > 0 && priceAusdWbtc > 0 && priceMonAusd > 0) {
             uint256 forwardOutput = FullMath.mulDiv(
                 FullMath.mulDiv(1e18, priceMonWbtc, priceAusdWbtc),
@@ -182,14 +242,18 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             );
 
             if (forwardOutput > minOutput) {
-                profitable = true;
-                expectedProfit = forwardOutput - 1e18;
-                return (profitable, expectedProfit);
+                uint256 tradeSize = estimateTradeSize();
+                // Profit in MON = tradeSize * (forwardOutput - 1e18) / 1e18
+                expectedProfit = FullMath.mulDiv(
+                    tradeSize,
+                    forwardOutput - 1e18,
+                    1e18
+                );
+                return (true, expectedProfit);
             }
         }
 
         // Reverse path: MON → AUSD → WBTC → MON
-        // 1 MON → priceMonAusd AUSD → (priceMonAusd*priceAusdWbtc) WBTC → (priceMonAusd*priceAusdWbtc/priceMonWbtc) MON
         if (priceAusdWbtc > 0 && priceMonAusd > 0 && priceMonWbtc > 0) {
             uint256 reverseOutput = FullMath.mulDiv(
                 FullMath.mulDiv(1e18, priceMonAusd, 1e18),
@@ -198,8 +262,13 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             );
 
             if (reverseOutput > minOutput) {
-                profitable = true;
-                expectedProfit = reverseOutput - 1e18;
+                uint256 tradeSize = estimateTradeSize();
+                expectedProfit = FullMath.mulDiv(
+                    tradeSize,
+                    reverseOutput - 1e18,
+                    1e18
+                );
+                return (true, expectedProfit);
             }
         }
     }
@@ -233,7 +302,7 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             AUSD_DECIMALS
         );
 
-        uint256 totalFeeBps = 15;
+        uint256 totalFeeBps = 50;
         uint256 minOutput = (1e18 * (10000 + totalFeeBps)) / 10000;
 
         bool isForward;
@@ -260,10 +329,17 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
             }
         }
 
-        // Trade size: 10 MON
-        uint256 tradeSize = 10 ether;
+        // Estimate optimal trade size based on bottleneck liquidity
+        uint256 tradeSize = estimateTradeSize();
 
-        bytes memory data = abi.encode(isForward, tradeSize);
+        // Pass current sqrtPrices for price limit calculation
+        bytes memory data = abi.encode(
+            isForward,
+            tradeSize,
+            sqrtMonWbtc,
+            sqrtAusdWbtc,
+            sqrtMonAusd
+        );
         PM.unlock(data);
 
         return true;
@@ -276,122 +352,141 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
     ) external returns (bytes memory) {
         require(msg.sender == address(PM), "Only PM");
 
-        (bool isForward, uint256 tradeSize) = abi.decode(data, (bool, uint256));
+        (
+            bool isForward,
+            uint256 tradeSize,
+            uint160 sqrtMonWbtc,
+            uint160 sqrtAusdWbtc,
+            uint160 sqrtMonAusd
+        ) = abi.decode(data, (bool, uint256, uint160, uint160, uint160));
 
         if (isForward) {
-            _executeForward(tradeSize);
+            _executeForward(tradeSize, sqrtMonWbtc);
         } else {
-            _executeReverse(tradeSize);
+            _executeReverse(tradeSize, sqrtMonAusd);
         }
 
         return "";
     }
 
     /// @notice Forward path: MON → WBTC → AUSD → MON
-    /// @dev Uses EXACT INPUT for each swap to handle different decimals correctly
-    function _executeForward(uint256 monAmount) internal {
-        // ============ SWAP 1: MON → WBTC (exact input MON) ============
+    /// @param sqrtMonWbtc Current sqrtPrice for price limit calculation
+    function _executeForward(uint256 monAmount, uint160 sqrtMonWbtc) internal {
+        // SWAP 1: MON → WBTC with calculated price limit
+        // Apply 50bps buffer to protect against price movement
+        // For zeroForOne=true, price decreases, so limit = current * sqrt(0.995)
+        uint160 sqrtLimit = uint160(
+            FullMath.mulDiv(uint256(sqrtMonWbtc), 997, 1000)
+        );
+        if (sqrtLimit <= TickMath.MIN_SQRT_PRICE) {
+            sqrtLimit = TickMath.MIN_SQRT_PRICE + 1;
+        }
+
         PoolKey memory keyMonWbtc = getPoolKeyMonWbtc();
         BalanceDelta delta1 = PM.swap(
             keyMonWbtc,
             IPoolManager.SwapParams({
-                zeroForOne: true, // MON (token0) → WBTC (token1)
-                amountSpecified: int256(monAmount), // POSITIVE = exact input
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true,
+                amountSpecified: int256(monAmount),
+                sqrtPriceLimitX96: sqrtLimit
             }),
             ""
         );
-        // delta1.amount0() < 0 (spent MON), delta1.amount1() > 0 (received WBTC)
-        require(delta1.amount1() > 0, "Swap1: no WBTC received");
+        require(delta1.amount1() > 0, "Swap1: no WBTC");
         uint256 wbtcReceived = uint256(int256(delta1.amount1()));
 
-        // ============ SWAP 2: WBTC → AUSD (exact input WBTC) ============
+        // SWAP 2: WBTC → AUSD
         PoolKey memory keyAusdWbtc = getPoolKeyAusdWbtc();
         BalanceDelta delta2 = PM.swap(
             keyAusdWbtc,
             IPoolManager.SwapParams({
-                zeroForOne: false, // WBTC (token1) → AUSD (token0)
-                amountSpecified: int256(wbtcReceived), // POSITIVE = exact input
+                zeroForOne: false,
+                amountSpecified: int256(wbtcReceived),
                 sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             ""
         );
-        // delta2.amount0() > 0 (received AUSD), delta2.amount1() < 0 (spent WBTC)
-        require(delta2.amount0() > 0, "Swap2: no AUSD received");
+        require(delta2.amount0() > 0, "Swap2: no AUSD");
         uint256 ausdReceived = uint256(int256(delta2.amount0()));
 
-        // ============ SWAP 3: AUSD → MON (exact input AUSD) ============
+        // SWAP 3: AUSD → MON
         PoolKey memory keyMonAusd = getPoolKeyMonAusd();
         BalanceDelta delta3 = PM.swap(
             keyMonAusd,
             IPoolManager.SwapParams({
-                zeroForOne: false, // AUSD (token1) → MON (token0)
-                amountSpecified: int256(ausdReceived), // POSITIVE = exact input
+                zeroForOne: false,
+                amountSpecified: int256(ausdReceived),
                 sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             ""
         );
-        // delta3.amount0() > 0 (received MON), delta3.amount1() < 0 (spent AUSD)
-        require(delta3.amount0() > 0, "Swap3: no MON received");
+        require(delta3.amount0() > 0, "Swap3: no MON");
         uint256 monReceived = uint256(int256(delta3.amount0()));
 
-        // ============ VERIFY PROFIT & SETTLE ============
+        // Verify profit & settle
         require(monReceived > monAmount, "Not profitable");
         uint256 profit = monReceived - monAmount;
 
-        // Take the net profit from PM
         PM.take(MON, address(this), profit);
 
-        // Send profit to owner
         (bool sent, ) = payable(owner).call{value: address(this).balance}("");
         require(sent, "ETH transfer failed");
     }
 
     /// @notice Reverse path: MON → AUSD → WBTC → MON
-    function _executeReverse(uint256 monAmount) internal {
-        // ============ SWAP 1: MON → AUSD (exact input MON) ============
+    /// @param sqrtMonAusd Current sqrtPrice for price limit calculation
+    function _executeReverse(uint256 monAmount, uint160 sqrtMonAusd) internal {
+        // SWAP 1: MON → AUSD with calculated price limit
+        // Apply 50bps buffer: limit = current * sqrt(0.995) ≈ current * 0.997
+        uint160 sqrtLimit = uint160(
+            FullMath.mulDiv(uint256(sqrtMonAusd), 997, 1000)
+        );
+        if (sqrtLimit <= TickMath.MIN_SQRT_PRICE) {
+            sqrtLimit = TickMath.MIN_SQRT_PRICE + 1;
+        }
+
         PoolKey memory keyMonAusd = getPoolKeyMonAusd();
         BalanceDelta delta1 = PM.swap(
             keyMonAusd,
             IPoolManager.SwapParams({
-                zeroForOne: true, // MON (token0) → AUSD (token1)
-                amountSpecified: int256(monAmount), // POSITIVE = exact input
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true,
+                amountSpecified: int256(monAmount),
+                sqrtPriceLimitX96: sqrtLimit
             }),
             ""
         );
-        require(delta1.amount1() > 0, "Swap1: no AUSD received");
+        require(delta1.amount1() > 0, "Swap1: no AUSD");
         uint256 ausdReceived = uint256(int256(delta1.amount1()));
 
-        // ============ SWAP 2: AUSD → WBTC (exact input AUSD) ============
+        // SWAP 2: AUSD → WBTC
         PoolKey memory keyAusdWbtc = getPoolKeyAusdWbtc();
         BalanceDelta delta2 = PM.swap(
             keyAusdWbtc,
             IPoolManager.SwapParams({
-                zeroForOne: true, // AUSD (token0) → WBTC (token1)
-                amountSpecified: int256(ausdReceived), // POSITIVE = exact input
+                zeroForOne: true,
+                amountSpecified: int256(ausdReceived),
                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             ""
         );
-        require(delta2.amount1() > 0, "Swap2: no WBTC received");
+        require(delta2.amount1() > 0, "Swap2: no WBTC");
         uint256 wbtcReceived = uint256(int256(delta2.amount1()));
 
-        // ============ SWAP 3: WBTC → MON (exact input WBTC) ============
+        // SWAP 3: WBTC → MON
         PoolKey memory keyMonWbtc = getPoolKeyMonWbtc();
         BalanceDelta delta3 = PM.swap(
             keyMonWbtc,
             IPoolManager.SwapParams({
-                zeroForOne: false, // WBTC (token1) → MON (token0)
-                amountSpecified: int256(wbtcReceived), // POSITIVE = exact input
+                zeroForOne: false,
+                amountSpecified: int256(wbtcReceived),
                 sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             ""
         );
-        require(delta3.amount0() > 0, "Swap3: no MON received");
+        require(delta3.amount0() > 0, "Swap3: no MON");
         uint256 monReceived = uint256(int256(delta3.amount0()));
 
-        // ============ VERIFY PROFIT & SETTLE ============
+        // Verify profit & settle
         require(monReceived > monAmount, "Not profitable");
         uint256 profit = monReceived - monAmount;
 

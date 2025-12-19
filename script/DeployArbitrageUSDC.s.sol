@@ -11,7 +11,7 @@ contract DeployArbitrageUSDC is Script {
         address poolManager = 0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e;
         address orderBook = 0x122C0D8683Cab344163fB73E28E741754257e3Fa; // MON/USDC
         address usdc = 0x754704Bc059F8C67012fEd69BC8A327a5aafb603;
-        address profitWallet = 0x774370b2BE82C1836A695d8653B5F9c4bb4985Fb;
+        address profitWallet = 0x0000000383dCfDc98cFda69dD8A9EEec239e35E1;
 
         vm.startBroadcast(deployerPrivateKey);
 

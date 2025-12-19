@@ -11,7 +11,7 @@ contract DeployArbitrageAUSD is Script {
         address poolManager = 0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e;
         address orderBook = 0xf39c4fD5465Ea2dD7b0756CeBC48a258b34FeBf3;
         address ausd = 0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a;
-        address profitWallet = 0x774370b2BE82C1836A695d8653B5F9c4bb4985Fb;
+        address profitWallet = 0x0000000383dCfDc98cFda69dD8A9EEec239e35E1;
 
         vm.startBroadcast(deployerPrivateKey);
 

@@ -6,7 +6,7 @@ import {ArbitrageGMON} from "../src/ArbitrageGMON.sol";
 
 contract DeployArbitrageGMON is Script {
     function run() external {
-        address profitWallet = 0x774370b2BE82C1836A695d8653B5F9c4bb4985Fb;
+        address profitWallet = 0x0000000383dCfDc98cFda69dD8A9EEec239e35E1;
 
         vm.startBroadcast();
 
