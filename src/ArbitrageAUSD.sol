@@ -136,7 +136,7 @@ contract ArbitrageAUSD is IUnlockCallback {
     // ============ KEEPER PROFIT (OPTIMIZED) ============
 
     /// @notice Lightweight profit check for off-chain keepers
-    /// @dev Uses 10 tick depth (vs 50) for speed. Returns only essential data.
+    /// @dev Uses 20 tick depth (vs 50) for speed. Returns only essential data.
     function keeperProfit()
         external
         view
@@ -148,13 +148,13 @@ contract ArbitrageAUSD is IUnlockCallback {
 
         // Forward check: Uni price < Kuru bid
         if (price1e18 < bestBid && bestBid > price1e18 + fee) {
-            uint256 kuruSize = getAggregatedBidSize(10, price1e18 + fee); // 10 ticks only!
+            uint256 kuruSize = getAggregatedBidSize(20, price1e18 + fee); // 20 ticks
             if (kuruSize > 0) {
-                // Use 60% of spread (midpoint + 10% skew towards best price)
-                // effectiveSpread = (bestBid - price1e18) * 0.6
-                uint256 effectiveSpread = ((bestBid - price1e18) * 8) / 10;
-                // Subtract execute() safety margin: 20bps price limit buffer
-                uint256 executeMargin = (bestBid * 20) / 10000;
+                // Use 90% of spread to better reflect actual execution
+                // effectiveSpread = (bestBid - price1e18) * 0.9
+                uint256 effectiveSpread = ((bestBid - price1e18) * 95) / 100;
+                // Subtract execute() safety margin: 20bps price + 25bps size = 45bps
+                uint256 executeMargin = (bestBid * 45) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -170,13 +170,13 @@ contract ArbitrageAUSD is IUnlockCallback {
         else if (
             price1e18 > bestAsk && bestAsk > 0 && bestAsk < price1e18 - fee
         ) {
-            (uint256 kuruSize, ) = getAggregatedAskSize(10, price1e18 - fee); // 10 ticks only!
+            (uint256 kuruSize, ) = getAggregatedAskSize(20, price1e18 - fee); // 20 ticks
             if (kuruSize > 0) {
-                // Use 60% of spread (midpoint + 10% skew towards best price)
-                // effectiveSpread = (price1e18 - bestAsk) * 0.6
-                uint256 effectiveSpread = ((price1e18 - bestAsk) * 8) / 10;
-                // Subtract execute() safety margins: 7bps price + 30bps quantity = 37bps
-                uint256 executeMargin = (bestAsk * 37) / 10000;
+                // Use 90% of spread to better reflect actual execution
+                // effectiveSpread = (price1e18 - bestAsk) * 0.9
+                uint256 effectiveSpread = ((price1e18 - bestAsk) * 95) / 100;
+                // Subtract execute() safety margins: 7bps price + 20bps quantity = 27bps
+                uint256 executeMargin = (bestAsk * 27) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -400,9 +400,9 @@ contract ArbitrageAUSD is IUnlockCallback {
                 uniPrice1e18 - fee
             );
 
-            // Buffer: Scale down maxAusdSpend by 0.3% to ensure monBought >= monDebt
+            // Buffer: Scale down maxAusdSpend by 0.2% to ensure monBought >= monDebt
             // after Kuru's 2bps taker fee (deducted from MON output)
-            maxAusdSpend = (maxAusdSpend * 9970) / 10000;
+            maxAusdSpend = (maxAusdSpend * 9980) / 10000;
 
             // Limit Price
             // Buffer: 7bps
@@ -479,8 +479,8 @@ contract ArbitrageAUSD is IUnlockCallback {
                 require(sent, "ETH Repatriation failed");
             }
         } else {
-            // Forward Arb: Scale down by 0.4% to account for Kuru taker fee + price precision
-            amountSpecified = int256((kuruAmount * 9960) / 10000);
+            // Forward Arb: Scale down by 0.25% to account for Kuru taker fee + price precision
+            amountSpecified = int256((kuruAmount * 9975) / 10000);
             IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
                 zeroForOne: zeroForOne,
                 amountSpecified: amountSpecified,

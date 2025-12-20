@@ -59,14 +59,14 @@ name = "Chainstack"
 # Base priority fee in gwei (applied to all transactions)
 base_priority_gwei = 30
 # Maximum priority fee cap in gwei (prevents overpaying)
-max_priority_gwei = 400
+max_priority_gwei = 500
 # Base max fee per gas in gwei (added to priority fee)
 base_max_fee_gwei = 100
 
 # Minimum profit threshold (in wei, 1e17 = 0.1 token) before adding profit-based priority
-min_profit_threshold = 100_000_000_000_000_000
+min_profit_threshold = 500_000_000_000_000_000
 # Percentage of profit to add to priority fee (e.g., 10 = 10%)
-profit_scaling_percent = 30
+profit_scaling_percent = 5
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRANSACTION CONFIGURATION
@@ -85,11 +85,11 @@ cooldown_blocks = 1
 # Comment out or remove bots to disable them
 
 [[bots]]
-address = "0x4A0F6430280fbfB8DEd1ED0F4bf88b402E496081"
+address = "0x6d88f1c1ac3861e31c907cf4e56c0d8b7f92dcbe"
 name = "USDC-v8"
 
 [[bots]]
-address = "0x10A4fc74b8D5dD2fd2f64345ADc7120f21CE7002"
+address = "0xbd9cc243c7fd8cfdf9a0bacb3f3a34421728927d"
 name = "AUSD-v8"
 
 

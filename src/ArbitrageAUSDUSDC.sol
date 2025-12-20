@@ -109,7 +109,7 @@ contract ArbitrageAUSDUSDC is IUnlockCallback {
     // ============ KEEPER PROFIT (LIGHTWEIGHT) ============
 
     /// @notice Lightweight profit check for off-chain keepers
-    /// @dev Uses 10 tick depth for speed.
+    /// @dev Uses 20 tick depth for speed.
     /// NOTE: Both Uni price and Kuru bestBidAsk return 1e18 scaled prices!
     function keeperProfit()
         external
@@ -124,11 +124,12 @@ contract ArbitrageAUSDUSDC is IUnlockCallback {
 
         // Forward: Uni price < Kuru bid → Buy AUSD on Uni, sell on Kuru
         if (price1e18 + fee < bestBid) {
-            uint256 kuruSize = getAggregatedBidSize(10, price1e18 + fee);
+            uint256 kuruSize = getAggregatedBidSize(20, price1e18 + fee);
             if (kuruSize > 0) {
-                // Min 1000 AUSD (6 decimals)
-                uint256 effectiveSpread = ((bestBid - price1e18) * 6) / 10;
-                uint256 executeMargin = (bestBid * 20) / 10000; // 20bps
+                // Use 95% of spread to better reflect actual execution
+                uint256 effectiveSpread = ((bestBid - price1e18) * 95) / 100;
+                // Margin: 20bps price + 25bps size = 45bps
+                uint256 executeMargin = (bestBid * 45) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -142,10 +143,12 @@ contract ArbitrageAUSDUSDC is IUnlockCallback {
         }
         // Reverse: Uni price > Kuru ask → Buy AUSD on Kuru, sell on Uni
         else if (price1e18 > bestAsk + fee && bestAsk > 0) {
-            (uint256 kuruSize, ) = getAggregatedAskSize(10, price1e18 - fee);
+            (uint256 kuruSize, ) = getAggregatedAskSize(20, price1e18 - fee);
             if (kuruSize > 0) {
-                uint256 effectiveSpread = ((price1e18 - bestAsk) * 6) / 10;
-                uint256 executeMargin = (bestAsk * 37) / 10000; // 37bps
+                // Use 95% of spread to better reflect actual execution
+                uint256 effectiveSpread = ((price1e18 - bestAsk) * 95) / 100;
+                // Margin: 7bps price + 20bps size = 27bps
+                uint256 executeMargin = (bestAsk * 27) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -193,7 +196,7 @@ contract ArbitrageAUSDUSDC is IUnlockCallback {
                 NUM_TICKS,
                 price1e18 - fee
             );
-            maxUsdcSpend = (maxUsdcSpend * 9970) / 10000; // 0.3% buffer
+            maxUsdcSpend = (maxUsdcSpend * 9980) / 10000; // 0.2% buffer
 
             // Limit: stop selling if Uni price <= bestAsk + 7bps margin
             uint256 safeAsk = (bestAsk * 10007) / 10000;

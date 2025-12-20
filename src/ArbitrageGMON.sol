@@ -118,7 +118,7 @@ contract ArbitrageGMON {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// @notice Lightweight profit check for off-chain keepers
-    /// @dev Uses 10 tick depth for speed. Returns only essential data.
+    /// @dev Uses 20 tick depth for speed. Returns only essential data.
     function keeperProfit()
         external
         view
@@ -140,10 +140,12 @@ contract ArbitrageGMON {
         // Forward: V3 price < Kuru bid → Buy gMON on V3 (cheap), sell on Kuru (expensive)
         // When V3 gives more gMON per MON than Kuru bid price
         if (v3Price + fee < kuruBid) {
-            uint256 kuruSize = getAggregatedBidSize(10, v3Price + fee);
+            uint256 kuruSize = getAggregatedBidSize(20, v3Price + fee);
             if (kuruSize > 0) {
-                uint256 effectiveSpread = ((kuruBid - v3Price) * 6) / 10;
-                uint256 executeMargin = (kuruBid * 20) / 10000;
+                // Use 95% of spread to better reflect actual execution
+                uint256 effectiveSpread = ((kuruBid - v3Price) * 95) / 100;
+                // Margin: 20bps price + 25bps size = 45bps
+                uint256 executeMargin = (kuruBid * 45) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -156,10 +158,12 @@ contract ArbitrageGMON {
         }
         // Reverse: V3 price > Kuru ask → Buy gMON on Kuru (cheap), sell on V3 (expensive)
         else if (v3Price > kuruAsk + fee && kuruAsk > 0) {
-            (uint256 kuruSize, ) = getAggregatedAskSize(10, v3Price - fee);
+            (uint256 kuruSize, ) = getAggregatedAskSize(20, v3Price - fee);
             if (kuruSize > 0) {
-                uint256 effectiveSpread = ((v3Price - kuruAsk) * 6) / 10;
-                uint256 executeMargin = (kuruAsk * 37) / 10000;
+                // Use 95% of spread to better reflect actual execution
+                uint256 effectiveSpread = ((v3Price - kuruAsk) * 95) / 100;
+                // Margin: 7bps price + 20bps size = 27bps
+                uint256 executeMargin = (kuruAsk * 27) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
                     expectedProfit =
                         ((effectiveSpread - fee - executeMargin) * kuruSize) /
@@ -175,8 +179,6 @@ contract ArbitrageGMON {
     /// @notice Execute arbitrage
     /// @return success True if arbitrage was profitable
     function execute() external returns (bool success) {
-        require(msg.sender == owner, "Not owner");
-
         (uint160 sqrtPriceX96, , , , , , ) = V3_POOL.slot0();
 
         // V3 price inverted to match Kuru's MON/gMON convention
@@ -220,7 +222,7 @@ contract ArbitrageGMON {
                 50,
                 v3Price - fee
             );
-            maxQuoteSpend = (maxQuoteSpend * 9970) / 10000; // 0.3% buffer
+            maxQuoteSpend = (maxQuoteSpend * 9980) / 10000; // 0.2% buffer
 
             // Calculate sqrtPriceLimit
             // We're selling gMON, which increases the V3 price (gMON/WMON)

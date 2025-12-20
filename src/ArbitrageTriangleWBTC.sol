@@ -64,8 +64,8 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
     uint8 constant AUSD_DECIMALS = 6;
 
     // Trade sizing parameters
-    // Max % of bottleneck liquidity to use (10% = 1000 / 10000)
-    uint256 constant LIQUIDITY_FRACTION = 1000; // 10%
+    // Max % of bottleneck liquidity to use (40% = 4000 / 10000)
+    uint256 constant LIQUIDITY_FRACTION = 4000; // 40%
     uint256 constant LIQUIDITY_DENOMINATOR = 10000;
 
     // Minimum trade size in MON (to cover gas)
@@ -276,8 +276,6 @@ contract ArbitrageTriangleWBTC is IUnlockCallback {
     // ============ EXECUTE ============
 
     function execute() external returns (bool) {
-        require(msg.sender == owner, "Not owner");
-
         uint160 sqrtMonWbtc = getSqrtPrice(getPoolKeyMonWbtc());
         uint160 sqrtAusdWbtc = getSqrtPrice(getPoolKeyAusdWbtc());
         uint160 sqrtMonAusd = getSqrtPrice(getPoolKeyMonAusd());
