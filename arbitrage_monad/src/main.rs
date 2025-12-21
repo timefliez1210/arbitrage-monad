@@ -502,7 +502,7 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                             
                             // Only act on "Proposed" state (earliest)
                             if let Some(state) = header.commitState {
-                                if state != "Proposed" {
+                                if state != "Proposed" { // @test: try voted
                                     // Log other states for visibility
                                     let block_num = u64::from_str_radix(header.number.trim_start_matches("0x"), 16).unwrap_or(0);
                                     let _ = log_tx.try_send(format!("   {} Block #{}", 

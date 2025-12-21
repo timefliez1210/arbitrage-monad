@@ -154,7 +154,7 @@ contract ArbitrageUSDC is IUnlockCallback {
             if (kuruSize > 0) {
                 // Use 90% of spread to better reflect actual execution
                 // effectiveSpread = (bestBid - price1e18) * 0.9
-                uint256 effectiveSpread = ((bestBid - price1e18) * 95) / 100;
+                uint256 effectiveSpread = ((bestBid - price1e18) * 94) / 100;
                 // Subtract execute() safety margin: 20bps price + 25bps size = 45bps
                 uint256 executeMargin = (bestBid * 45) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
@@ -176,7 +176,7 @@ contract ArbitrageUSDC is IUnlockCallback {
             if (kuruSize > 0) {
                 // Use 90% of spread to better reflect actual execution
                 // effectiveSpread = (price1e18 - bestAsk) * 0.9
-                uint256 effectiveSpread = ((price1e18 - bestAsk) * 95) / 100;
+                uint256 effectiveSpread = ((price1e18 - bestAsk) * 94) / 100;
                 // Subtract execute() safety margins: 7bps price + 20bps quantity = 27bps
                 uint256 executeMargin = (bestAsk * 27) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
@@ -186,173 +186,6 @@ contract ArbitrageUSDC is IUnlockCallback {
                     // Threshold: 0.75 MON
                     if (expectedProfit > 0.75 ether) {
                         profitable = true;
-                    }
-                }
-            }
-        }
-    }
-
-    function calculateProfit()
-        public
-        view
-        returns (
-            bool profitable,
-            bool zeroForOne,
-            bytes memory data,
-            uint256 price1e18,
-            uint256 bestBid,
-            uint256 bestAsk,
-            uint256 expectedProfit
-        )
-    {
-        // 1. Get Uniswap Market Price
-        price1e18 = getUniswapPrice(USDC_CURRENCY);
-
-        // 2. Get Current OrderBook State
-        (bestBid, bestAsk) = OB_USDC.bestBidAsk();
-
-        // first comparison is to see if we can make a profit
-        uint32 ticksToQueuery = 50;
-        if (price1e18 < bestBid) {
-            // If true, we need to know how much we can trade:
-            // 1. queuery orderbook for available liquidity
-
-            // Sum up the orders in the range where price1e18 is less than bestBid
-            // This is a "dangerous assumption": We assume by default bigger liquidity in uniswap than kuru at any given time
-            // So basically we accept some reverts if uniswaps liquidity is lower than kuru
-            // Fee Calculation:
-            // Uniswap Fee Tier 500 = 0.05% = 5 bps
-            // Kuru Taker Fee = 0.02% = 2 bps
-            // Total = 7 bps
-            uint256 fee = (price1e18 * 7) / 10000;
-            uint256 minPrice = price1e18 + fee;
-
-            uint256 bestBidSizeKuru = getAggregatedBidSize(
-                ticksToQueuery,
-                minPrice
-            );
-
-            if (bestBidSizeKuru == 0) {
-                return (
-                    false,
-                    false,
-                    data,
-                    price1e18,
-                    bestBid,
-                    bestAsk,
-                    expectedProfit
-                );
-            }
-
-            uint256 amountInWei = bestBidSizeKuru;
-
-            // Truncate to Kuru Precision (Scalar = 1e7)
-            // BASE(18) / SIZE(11) = 1e7
-            {
-                uint256 scalar = BASE_MULTIPLIER / SIZE_PRECISION;
-                amountInWei = (amountInWei / scalar) * scalar;
-
-                // SAFETY: Scale down by 0.7% to account for Kuru Fees (deducted from output) and rounding.
-                amountInWei = (amountInWei * 9930) / 10000;
-            }
-            // ------------------------------------------------
-
-            // Check if spread covers fees
-            if (bestBid > price1e18 + fee) {
-                uint256 potentialProfit = ((bestBid - (price1e18 + fee)) *
-                    bestBidSizeKuru) / 1e18;
-                // Threshold: 0.03 USDC (3 cents) in 1e18 format = 3e16
-                if (potentialProfit > 3e16) {
-                    expectedProfit = potentialProfit;
-                    profitable = true;
-                    zeroForOne = false;
-
-                    // Calc SqrtLimit with Margin
-                    // Stop buying if Uni Price approaches BestBid. Leave 7bps margin for fees/slippage.
-                    // Target = bestBid * (1 - 0.0007)
-                    uint256 safeBid = (bestBid * 9993) / 10000;
-                    uint256 rootBid = FixedPointMathLib.sqrt(safeBid);
-                    uint160 limit = uint160(
-                        FullMath.mulDiv(rootBid, 1 << 96, SQRT_PRICE_SCALE)
-                    );
-
-                    data = abi.encode(zeroForOne, amountInWei, limit);
-                }
-            }
-        } else if (price1e18 > bestAsk) {
-            // Reverse Arb: Buy on Kuru (Low), Sell on Uniswap (High)
-            // We need to know how much we can buy on Kuru:
-            // uint32 ticksToQueuery = 20; // Already defined above
-
-            // Fee Calculation:
-            // Uniswap Fee = 5 bps
-            // Kuru Fee = 2 bps
-            // Total = 7 bps
-            uint256 fee = (price1e18 * 7) / 10000;
-            // We can buy as long as Ask Price < Uniswap Price - Fee
-            uint256 maxPrice = price1e18 - fee;
-
-            (uint256 bestAskSizeKuru, ) = getAggregatedAskSize(
-                ticksToQueuery,
-                maxPrice
-            );
-
-            if (bestAskSizeKuru == 0) {
-                return (
-                    false,
-                    true,
-                    data,
-                    price1e18,
-                    bestBid,
-                    bestAsk,
-                    expectedProfit
-                );
-            }
-
-            uint256 maxAmount;
-
-            // Convert `bestAskSizeKuru` (MON) to USDC (`maxAmount`).
-            // maxAmount [USDC] = bestAskSizeKuru [MON] * bestAsk [Price] / 1e18.
-            maxAmount = (bestAskSizeKuru * bestAsk) / 1e18;
-
-            // Truncate to Kuru Precision (Scalar = 1e7)
-            {
-                uint256 scalar = BASE_MULTIPLIER / SIZE_PRECISION;
-                maxAmount = (maxAmount / scalar) * scalar;
-
-                // SAFETY: Scale down by 0.7% to account for Kuru Fees (deducted from output) and rounding.
-                maxAmount = (maxAmount * 9930) / 10000;
-            }
-            // ------------------------------------------------
-
-            // We will borrow USDC to buy MON on Kuru
-            // amountInWei here will represent the USDC amount to borrow
-            uint256 amountInWei = maxAmount;
-
-            // Check if spread covers fees
-            if (bestAsk < price1e18 - fee) {
-                // Scoped block to avoid Stack Too Deep
-                {
-                    // Profit in MON Value = (Spread * Size) / Price
-                    // ((price1e18 - fee - bestAsk) * bestAskSizeKuru) / price1e18
-                    uint256 potentialProfitMON = ((price1e18 - fee - bestAsk) *
-                        bestAskSizeKuru) / price1e18;
-
-                    if (potentialProfitMON > 1 ether) {
-                        expectedProfit = potentialProfitMON;
-                        profitable = true;
-                        zeroForOne = true;
-
-                        // Calc SqrtLimit with Margin
-                        // Stop selling if Uni Price drops to BestAsk. Leave 7bps margin.
-                        // Target = bestAsk * (1 + 0.0007)
-                        uint256 safeAsk = (bestAsk * 10007) / 10000;
-                        uint256 rootAsk = FixedPointMathLib.sqrt(safeAsk);
-                        uint160 limit = uint160(
-                            FullMath.mulDiv(rootAsk, 1 << 96, SQRT_PRICE_SCALE)
-                        );
-
-                        data = abi.encode(zeroForOne, amountInWei, limit);
                     }
                 }
             }
