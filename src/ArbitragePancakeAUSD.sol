@@ -91,7 +91,7 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
         if (pcsPrice < kuruBid && kuruBid > pcsPrice + fee) {
             uint256 kuruSize = getAggregatedBidSize(20, pcsPrice + fee);
             if (kuruSize > 0) {
-                uint256 spread = ((kuruBid - pcsPrice) * 95) / 100;
+                uint256 spread = ((kuruBid - pcsPrice) * 94) / 100;
                 uint256 margin = (kuruBid * 45) / 10000;
                 if (spread > fee + margin) {
                     expectedProfit =
@@ -107,7 +107,7 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
         ) {
             (uint256 kuruSize, ) = getAggregatedAskSize(20, pcsPrice - fee);
             if (kuruSize > 0) {
-                uint256 spread = ((pcsPrice - kuruAsk) * 95) / 100;
+                uint256 spread = ((pcsPrice - kuruAsk) * 94) / 100;
                 uint256 margin = (kuruAsk * 27) / 10000;
                 if (spread > fee + margin) {
                     expectedProfit =
@@ -231,10 +231,40 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
             if (wmonBal < wmonOwed) revert InsufficientOutput();
             WMON.transfer(msg.sender, wmonOwed);
 
-            // Send remaining MON profit to owner
+            // Unwrap any remaining WMON to MON
+            uint256 wmonRemaining = WMON.balanceOf(address(this));
+            if (wmonRemaining > 0) {
+                WMON.withdraw(wmonRemaining);
+            }
+
+            // Send all remaining MON profit to owner
             if (address(this).balance > 0) {
                 payable(owner).call{value: address(this).balance}("");
             }
+        }
+    }
+
+    // ============ ADMIN ============
+
+    function emergencyWithdraw() external {
+        require(msg.sender == owner, "Not owner");
+
+        // Withdraw native MON
+        if (address(this).balance > 0) {
+            payable(owner).call{value: address(this).balance}("");
+        }
+
+        // Withdraw WMON (unwrap first)
+        uint256 wmonBal = WMON.balanceOf(address(this));
+        if (wmonBal > 0) {
+            WMON.withdraw(wmonBal);
+            payable(owner).call{value: address(this).balance}("");
+        }
+
+        // Withdraw AUSD
+        uint256 ausdBal = AUSD.balanceOf(address(this));
+        if (ausdBal > 0) {
+            AUSD.transfer(owner, ausdBal);
         }
     }
 

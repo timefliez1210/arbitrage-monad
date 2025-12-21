@@ -152,7 +152,7 @@ contract ArbitrageAUSD is IUnlockCallback {
             if (kuruSize > 0) {
                 // Use 90% of spread to better reflect actual execution
                 // effectiveSpread = (bestBid - price1e18) * 0.9
-                uint256 effectiveSpread = ((bestBid - price1e18) * 95) / 100;
+                uint256 effectiveSpread = ((bestBid - price1e18) * 94) / 100;
                 // Subtract execute() safety margin: 20bps price + 25bps size = 45bps
                 uint256 executeMargin = (bestBid * 45) / 10000;
                 if (effectiveSpread > fee + executeMargin) {
@@ -174,7 +174,7 @@ contract ArbitrageAUSD is IUnlockCallback {
             if (kuruSize > 0) {
                 // Use 90% of spread to better reflect actual execution
                 // effectiveSpread = (price1e18 - bestAsk) * 0.9
-                uint256 effectiveSpread = ((price1e18 - bestAsk) * 95) / 100;
+                uint256 effectiveSpread = ((price1e18 - bestAsk) * 94) / 100;
                 // Subtract execute() safety margins: 7bps price + 20bps quantity = 27bps
                 uint256 executeMargin = (bestAsk * 27) / 10000;
                 if (effectiveSpread > fee + executeMargin) {

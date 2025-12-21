@@ -123,21 +123,45 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
 
     // ============ LIQUIDITY ESTIMATION ============
 
-    /// @notice Estimate trade size based on PCS pool liquidity
+    /// @notice Estimate trade size based on min of UniV4 and PCS pool liquidity
+    /// @dev Queries both pools and uses the lower liquidity as bottleneck
     function estimateTradeSize() public view returns (uint256 tradeSize) {
-        // Get PCS pool liquidity
-        // For simplicity, use a fixed approach based on pool observation
-        // Real implementation would query liquidity in tick range
-        uint256 pcsPrice = getPancakePrice();
-        if (pcsPrice == 0) return MIN_TRADE_SIZE;
+        uint256 uniPrice = getUniswapPrice(); // WBTC per MON in 1e18
+        if (uniPrice == 0) return MIN_TRADE_SIZE;
 
-        // Conservative: assume ~0.1 WBTC tradeable (10M satoshi)
-        // Convert to MON: MON = 0.1 WBTC / (WBTC per MON)
-        // = 0.1 * 1e8 * 1e18 / pcsPrice
-        uint256 tradeableMon = FullMath.mulDiv(1e7, 1e18, pcsPrice);
+        // Get UniV4 MON/WBTC pool liquidity
+        PoolId poolId = getPoolKeyMonWbtc().toId();
+        uint128 uniLiquidity = PM.getLiquidity(poolId);
 
+        // Get PCS WBTC/WMON pool liquidity
+        uint128 pcsLiquidity = PCS_POOL.liquidity();
+
+        // Use minimum of both as bottleneck
+        uint128 bottleneckLiquidity = uniLiquidity < pcsLiquidity
+            ? uniLiquidity
+            : pcsLiquidity;
+
+        if (bottleneckLiquidity == 0) {
+            return MIN_TRADE_SIZE;
+        }
+
+        // Approximate tradeable WBTC from liquidity
+        // In Uniswap V3/V4: liquidity L relates to amounts via deltaX ≈ L / 1e6
+        // This is conservative and depends on tick range
+        uint256 tradeableWbtc = uint256(bottleneckLiquidity) / 1e6;
+
+        // Convert WBTC to MON: MON = WBTC * 1e18 / priceWbtcPerMon
+        // tradeableWbtc is in 1e8 (WBTC decimals), need to scale to 1e18
+        uint256 tradeableMon = FullMath.mulDiv(
+            tradeableWbtc * 1e10, // Scale WBTC(8) to 18 decimals
+            1e18,
+            uniPrice
+        );
+
+        // Take 40% of tradeable amount
         tradeSize = (tradeableMon * LIQUIDITY_FRACTION) / 10000;
 
+        // Clamp to bounds
         if (tradeSize < MIN_TRADE_SIZE) tradeSize = MIN_TRADE_SIZE;
         if (tradeSize > MAX_TRADE_SIZE) tradeSize = MAX_TRADE_SIZE;
     }
@@ -222,10 +246,21 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
     }
 
     /// @notice Forward: MON → WBTC (UniV4) → WMON (PCS) → MON
-    /// @dev Uni cheap, PCS dear. Swap MON->WBTC on Uni, WBTC->WMON on PCS, unwrap
+    /// @dev Uni cheap, PCS dear. exactOutput WBTC, swap on PCS, settle MON
     function _executeForward(uint256 monAmount, uint160 sqrtPriceUni) internal {
-        // SWAP 1: MON → WBTC on UniV4 (exactInput with price limit)
-        // zeroForOne=true (MON is currency0)
+        // Calculate expected WBTC from monAmount at current price
+        // For simplicity, use a conservative estimate
+        uint256 uniPrice = getUniswapPrice(); // WBTC per MON in 1e18
+        uint256 wbtcExpected = FullMath.mulDiv(monAmount, uniPrice, 1e18);
+        // Scale from 1e18 to WBTC decimals (1e8)
+        wbtcExpected = wbtcExpected / 1e10;
+        // Apply 0.5% slippage buffer
+        wbtcExpected = (wbtcExpected * 995) / 1000;
+
+        if (wbtcExpected == 0) return;
+
+        // SWAP 1: MON → WBTC on UniV4 (exactOutput WBTC)
+        // zeroForOne=true, negative amountSpecified = exactOutput
         uint160 sqrtLimit = uint160(
             FullMath.mulDiv(uint256(sqrtPriceUni), 997, 1000)
         );
@@ -237,16 +272,18 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
             key,
             IPoolManager.SwapParams({
                 zeroForOne: true,
-                amountSpecified: int256(monAmount), // exactInput MON
+                amountSpecified: -int256(wbtcExpected), // negative = exactOutput WBTC
                 sqrtPriceLimitX96: sqrtLimit
             }),
             ""
         );
 
-        // delta.amount0() = negative (we spent MON)
-        // delta.amount1() = positive (we received WBTC)
+        // For zeroForOne=true exactOutput:
+        // delta.amount0() = negative (we owe MON)
+        // delta.amount1() = positive (we receive exactly wbtcExpected WBTC)
         require(delta.amount1() > 0, "No WBTC received");
         uint256 wbtcReceived = uint256(int256(delta.amount1()));
+        uint256 monOwed = uint256(-int256(delta.amount0()));
 
         // Take WBTC from PM
         PM.take(WBTC_CURRENCY, address(this), wbtcReceived);
@@ -259,15 +296,15 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
             true, // WBTC -> WMON
             int256(wbtcReceived), // exactInput
             TickMath.MIN_SQRT_PRICE + 1,
-            abi.encode(true) // isForward
+            abi.encode(true)
         );
 
         // After PCS callback, we have WMON - unwrap to MON
         uint256 wmonBal = WMON.balanceOf(address(this));
         WMON.withdraw(wmonBal);
 
-        // Settle MON debt to UniV4 (we owe monAmount from the swap)
-        PM.settle{value: monAmount}();
+        // Settle MON debt to UniV4
+        PM.settle{value: monOwed}();
 
         // Profit = remaining MON
         uint256 profit = address(this).balance;
@@ -276,27 +313,11 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
         }
     }
 
-    /// @notice Reverse: MON (from PCS path) → settle Uni
-    /// @dev PCS cheap, Uni dear. Get WMON from PCS, unwrap, swap MON->WBTC on Uni
+    /// @notice Reverse: PCS cheap, Uni dear
+    /// @dev Flash WBTC->MON on Uni, wrap MON, PCS WMON->WBTC, settle WBTC debt, profit in WBTC
     function _executeReverse(uint256 monAmount, uint160 sqrtPriceUni) internal {
-        // We start with MON
-        // SWAP 1: Wrap MON → WMON, swap WMON → WBTC on PCS
-        WMON.deposit{value: monAmount}();
-
-        WMON.approve(address(PCS_POOL), monAmount);
-        PCS_POOL.swap(
-            address(this),
-            false, // WMON(token1) -> WBTC(token0)
-            int256(monAmount), // exactInput WMON
-            TickMath.MAX_SQRT_PRICE - 1,
-            abi.encode(false) // isReverse
-        );
-
-        // After PCS callback, we have WBTC - swap on UniV4
-        uint256 wbtcBal = WBTC.balanceOf(address(this));
-
-        // SWAP 2: WBTC → MON on UniV4
-        // zeroForOne=false (WBTC is currency1)
+        // SWAP 1: WBTC → MON on UniV4 (exactOutput for MON, we'll owe WBTC)
+        // zeroForOne=false (WBTC is currency1 → MON is currency0)
         uint160 sqrtLimit = uint160(
             FullMath.mulDiv(uint256(sqrtPriceUni), 1003, 1000)
         );
@@ -304,34 +325,53 @@ contract ArbitragePancakeWBTC is IUnlockCallback, IPancakeV3SwapCallback {
             sqrtLimit = TickMath.MAX_SQRT_PRICE - 1;
 
         PoolKey memory key = getPoolKeyMonWbtc();
-
-        // Sync and transfer WBTC to settle UniV4 input
-        PM.sync(WBTC_CURRENCY);
-        WBTC.transfer(address(PM), wbtcBal);
-        PM.settle();
-
         BalanceDelta delta = PM.swap(
             key,
             IPoolManager.SwapParams({
-                zeroForOne: false, // WBTC -> MON
-                amountSpecified: int256(wbtcBal), // exactInput WBTC
+                zeroForOne: false, // WBTC -> MON (currency1 -> currency0)
+                amountSpecified: -int256(monAmount), // negative = exactOutput MON
                 sqrtPriceLimitX96: sqrtLimit
             }),
             ""
         );
 
-        // delta.amount0() = positive (we received MON)
+        // For zeroForOne=false exactOutput:
+        // delta.amount0() = positive (we receive MON)
+        // delta.amount1() = negative (we owe WBTC)
         require(delta.amount0() > 0, "No MON received");
         uint256 monReceived = uint256(int256(delta.amount0()));
+        uint256 wbtcOwed = uint256(-int256(delta.amount1()));
 
-        // Take MON profit
+        // Take MON from PM
         PM.take(MON, address(this), monReceived);
 
-        // Profit = MON received - MON we started with
-        require(monReceived > monAmount, "Not profitable");
+        // Wrap MON → WMON
+        WMON.deposit{value: monReceived}();
 
-        if (address(this).balance > 0) {
-            payable(owner).call{value: address(this).balance}("");
+        // SWAP 2: WMON → WBTC on PCS (exactInput)
+        // zeroForOne=false means WMON(token1) → WBTC(token0)
+        WMON.approve(address(PCS_POOL), monReceived);
+        PCS_POOL.swap(
+            address(this),
+            false, // WMON -> WBTC
+            int256(monReceived), // exactInput WMON
+            TickMath.MAX_SQRT_PRICE - 1,
+            abi.encode(false) // isReverse
+        );
+
+        // After PCS callback, we have WBTC
+        uint256 wbtcBal = WBTC.balanceOf(address(this));
+        require(wbtcBal >= wbtcOwed, "Not enough WBTC");
+
+        // Settle WBTC debt to UniV4
+        PM.sync(WBTC_CURRENCY);
+        WBTC.transfer(address(PM), wbtcOwed);
+        PM.settle();
+
+        // Profit = remaining WBTC
+        uint256 profit = WBTC.balanceOf(address(this));
+        if (profit > 0) {
+            WBTC.transfer(owner, profit);
         }
     }
 

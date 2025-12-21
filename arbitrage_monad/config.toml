@@ -64,7 +64,7 @@ max_priority_gwei = 500
 base_max_fee_gwei = 100
 
 # Minimum profit threshold (in wei, 1e17 = 0.1 token) before adding profit-based priority
-min_profit_threshold = 500_000_000_000_000_000
+min_profit_threshold = 1_000_000_000_000_000_000
 # Percentage of profit to add to priority fee (e.g., 10 = 10%)
 profit_scaling_percent = 5
 
@@ -85,13 +85,16 @@ cooldown_blocks = 1
 # Comment out or remove bots to disable them
 
 [[bots]]
-address = "0x6d88f1c1ac3861e31c907cf4e56c0d8b7f92dcbe"
-name = "USDC-v8"
+address = "0xbfe7c25725833b8e7e956a982a1db75a930092dc"
+name = "USDC Uni"
 
 [[bots]]
-address = "0xbd9cc243c7fd8cfdf9a0bacb3f3a34421728927d"
-name = "AUSD-v8"
+address = "0xd094376118983aecbf8496d84caa96df6a3976d1"
+name = "AUSD Uni"
 
+#[[bots]]
+#address = "0xf7f6ef554f16f7c099a9adecf8efb4e836f7434a"
+#name = "AUSD Pancake"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING CONFIGURATION
