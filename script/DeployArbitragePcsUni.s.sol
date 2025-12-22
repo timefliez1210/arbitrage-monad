@@ -13,8 +13,8 @@ contract DeployArbitragePcsUni is Script {
     address constant PCS_AUSD_WMON = 0xD5b70d70CBE6C42bCD1aaa662A21673A83f4615b;
     address constant PCS_WMON_USDC = 0x63e48B725540A3Db24ACF6682a29f877808C53F2;
 
-    // Uniswap V4 PoolManager
-    address constant POOL_MANAGER = 0xb1860D529182ac3BC1F51Fa2ABd56662b7D13f33;
+    // Uniswap V4 PoolManager (same as working Kuru contracts)
+    address constant POOL_MANAGER = 0x188d586Ddcf52439676Ca21A244753fA19F9Ea8e;
 
     // Tokens
     address constant WMON = 0x3bd359C1119dA7Da1D913D1C4D2B7c461115433A;

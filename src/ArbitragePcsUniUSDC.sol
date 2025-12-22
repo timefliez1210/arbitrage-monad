@@ -90,7 +90,8 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
                 currency0: MON_CURRENCY,
                 currency1: USDC_CURRENCY,
                 fee: 500,
-                tickSpacing: 1,
+                // MON/USDC TickSpacing is 10
+                tickSpacing: 10,
                 hooks: IHooks(address(0))
             });
     }

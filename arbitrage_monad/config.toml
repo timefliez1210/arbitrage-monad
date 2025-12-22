@@ -93,7 +93,7 @@ address = "0xd094376118983aecbf8496d84caa96df6a3976d1"
 name = "AUSD Uni"
 
 [[bots]]
-address = "0xb949a9b4a8ab55a771f9c67d9c5a35af532099ba"
+address = "0x386fa87ff4ca03f84663b5a109a33518c3ca3ad2"
 name = "AUSD Pancake"
 
 # ═══════════════════════════════════════════════════════════════════════════════

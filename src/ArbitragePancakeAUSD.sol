@@ -163,12 +163,12 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
             // after Kuru's 2bps taker fee (deducted from MON output)
             maxQuoteSpend = (maxQuoteSpend * 9980) / 10000;
 
-            // Calculate price limit for zeroForOne=false (sqrtPrice INCREASES)
-            // We want to STOP if PCS price drops too close to kuruAsk
-            // AUSD/WMON pool: lower AUSD/MON price = HIGHER sqrtPrice (inverse!)
-            // So safeAsk = kuruAsk * 0.9993 → LOWER AUSD/MON → HIGHER sqrtPrice
-            // For zeroForOne=false: limit is UPPER BOUND
-            uint256 safeAsk = (kuruAsk * 9993) / 10000;
+            // Calculate price limit for zeroForOne=false (sqrtPrice DECREASES)
+            // We want to STOP if PCS price drops to kuruAsk (or below)
+            // AUSD/WMON pool: HIGHER AUSD/MON price = LOWER sqrtPrice (inverse!)
+            // For zeroForOne=false: limit is LOWER BOUND on sqrtPrice
+            // So safeAsk = kuruAsk * 1.0007 → HIGHER price → LOWER sqrtPrice (correct lower bound)
+            uint256 safeAsk = (kuruAsk * 10007) / 10000;
             uint160 sqrtLimit = _priceToSqrtPriceAUSD(safeAsk);
 
             // zeroForOne = false → WMON (token1) -> AUSD (token0)

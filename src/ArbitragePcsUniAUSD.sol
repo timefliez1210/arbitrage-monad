@@ -342,7 +342,11 @@ contract ArbitragePcsUniAUSD is IPancakeV3SwapCallback, IUnlockCallback {
 
             WMON.withdraw(wmonReceived);
 
-            uint160 uniLimit = _priceToSqrtPriceUni((uniPrice * 9993) / 10000);
+            // For forward arb: zeroForOne=true (MON→AUSD), price DECREASES
+            // sqrtPrice = sqrt(AUSD/MON), so lower price = lower sqrtPrice
+            // We need LOWER BOUND on sqrtPrice (stop if price goes too low)
+            // Use uniPrice * 1.0007 → HIGHER price → LOWER sqrtPrice (inverse pool)
+            uint160 uniLimit = _priceToSqrtPriceUni((uniPrice * 10007) / 10000);
             PM.unlock(abi.encode(true, wmonReceived, ausdOwed, uniLimit));
         }
     }
@@ -365,6 +369,8 @@ contract ArbitragePcsUniAUSD is IPancakeV3SwapCallback, IUnlockCallback {
             uint256 ausdOwed = amountAusdOrPcsPrice;
 
             PoolKey memory key = getPoolKey();
+            // Forward: sell MON (token0) for AUSD (token1)
+            // zeroForOne=true: token0 → token1, amountSpecified>0 = exactInput
             BalanceDelta delta = PM.swap(
                 key,
                 IPoolManager.SwapParams({
@@ -375,6 +381,8 @@ contract ArbitragePcsUniAUSD is IPancakeV3SwapCallback, IUnlockCallback {
                 ""
             );
 
+            // delta.amount0() > 0 means we OWE MON (correct for selling)
+            // delta.amount1() < 0 means we RECEIVE AUSD (correct for buying)
             int128 monSpent = delta.amount0();
             int128 ausdReceived = -delta.amount1();
 
@@ -402,6 +410,8 @@ contract ArbitragePcsUniAUSD is IPancakeV3SwapCallback, IUnlockCallback {
             uint256 pcsPrice = amountAusdOrPcsPrice;
 
             PoolKey memory key = getPoolKey();
+            // Reverse: sell AUSD (token1) for MON (token0)
+            // zeroForOne=false: token1 → token0, amountSpecified<0 = exactOutput (we want MON)
             BalanceDelta delta = PM.swap(
                 key,
                 IPoolManager.SwapParams({
@@ -412,6 +422,8 @@ contract ArbitragePcsUniAUSD is IPancakeV3SwapCallback, IUnlockCallback {
                 ""
             );
 
+            // delta.amount0() < 0 means we RECEIVE MON (correct for buying)
+            // delta.amount1() > 0 means we OWE AUSD (correct for selling)
             int128 monReceived = -delta.amount0();
             int128 ausdDebt = delta.amount1();
 
