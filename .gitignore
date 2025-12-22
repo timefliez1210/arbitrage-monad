@@ -37,3 +37,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Keystore files
+arbitrage_monad/UTC--*
