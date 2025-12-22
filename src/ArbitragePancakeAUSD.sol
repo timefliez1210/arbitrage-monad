@@ -133,13 +133,21 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
 
             uint256 wmonToBuy = (kuruVolWei * 9975) / 10000;
 
+            // Calculate price limit for zeroForOne=true (sqrtPrice DECREASES)
+            // We want to STOP if PCS price rises too close to kuruBid
+            // AUSD/WMON pool: higher AUSD/MON price = LOWER sqrtPrice (inverse!)
+            // So safeBid = kuruBid * 1.002 → HIGHER AUSD/MON → LOWER sqrtPrice
+            // For zeroForOne=true: limit is LOWER BOUND
+            uint256 safeBid = (kuruBid * 10020) / 10000;
+            uint160 sqrtLimit = _priceToSqrtPriceAUSD(safeBid);
+
             // zeroForOne = true → AUSD (token0) -> WMON (token1)
             // amountSpecified = negative → exactOutput (we want WMON)
             PCS_POOL.swap(
                 address(this),
                 true, // AUSD -> WMON
                 -int256(wmonToBuy),
-                4295128740, // min sqrtPrice
+                sqrtLimit,
                 abi.encode(true, kuruVolWei)
             );
             return true;
@@ -151,19 +159,48 @@ contract ArbitragePancakeAUSD is IPancakeV3SwapCallback {
             );
             if (kuruVolWei == 0) return false;
 
+            // Buffer: Scale down maxQuoteSpend by 0.2% to ensure monBought >= monDebt
+            // after Kuru's 2bps taker fee (deducted from MON output)
+            maxQuoteSpend = (maxQuoteSpend * 9980) / 10000;
+
+            // Calculate price limit for zeroForOne=false (sqrtPrice INCREASES)
+            // We want to STOP if PCS price drops too close to kuruAsk
+            // AUSD/WMON pool: lower AUSD/MON price = HIGHER sqrtPrice (inverse!)
+            // So safeAsk = kuruAsk * 0.9993 → LOWER AUSD/MON → HIGHER sqrtPrice
+            // For zeroForOne=false: limit is UPPER BOUND
+            uint256 safeAsk = (kuruAsk * 9993) / 10000;
+            uint160 sqrtLimit = _priceToSqrtPriceAUSD(safeAsk);
+
             // zeroForOne = false → WMON (token1) -> AUSD (token0)
             // We want AUSD first to buy on Kuru
             PCS_POOL.swap(
                 address(this),
                 false, // WMON -> AUSD
                 -int256(maxQuoteSpend),
-                1461446703485210103287273052203988822378723970341, // max sqrtPrice
+                sqrtLimit,
                 abi.encode(false, kuruVolWei, maxQuoteSpend)
             );
             return true;
         }
 
         return false;
+    }
+
+    /// @notice Convert AUSD/MON price (1e18) to sqrtPriceX96 for AUSD/WMON pool
+    /// @dev Pool is AUSD/WMON: sqrtPrice = sqrt(WMON/AUSD) * 2^96
+    ///      WMON/AUSD = 1e30 / priceAusdPerMon
+    function _priceToSqrtPriceAUSD(
+        uint256 priceAusdPerMon
+    ) internal pure returns (uint160) {
+        // WMON/AUSD = 1e30 / priceAusdPerMon
+        uint256 inversePrice = (1e30 * 1e18) / priceAusdPerMon; // Scale to 1e18 for sqrt
+        // sqrtPriceX96 = sqrt(inversePrice / 1e18) * 2^96
+        uint256 sqrtInverse = FixedPointMathLib.sqrt(inversePrice);
+        // sqrtInverse is sqrt(inversePrice), which is sqrt(1e30/price * 1e18) = sqrt(1e48/price)
+        // We need sqrt(1e30/price) * 2^96
+        // sqrtInverse = sqrt(1e48/price), so sqrtInverse / 1e9 = sqrt(1e30/price)
+        // Then multiply by 2^96
+        return uint160(FullMath.mulDiv(sqrtInverse, 1 << 96, 1e9));
     }
 
     // ============ PCS CALLBACK ============

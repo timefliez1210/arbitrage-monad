@@ -136,13 +136,20 @@ contract ArbitragePancakeUSDC is IPancakeV3SwapCallback {
 
             uint256 wmonToBuy = (kuruVolWei * 9975) / 10000;
 
+            // Calculate price limit: Stop if PCS price rises to kuruBid (minus margin)
+            // safeBid = kuruBid * 0.998 (20bps buffer)
+            // For WMON/USDC pool: higher USDC/MON price = HIGHER sqrtPrice
+            // zeroForOne=false means price increases, so use safeBid as upper bound
+            uint256 safeBid = (kuruBid * 9980) / 10000;
+            uint160 sqrtLimit = _priceToSqrtPriceUSDC(safeBid);
+
             // zeroForOne = false → USDC (token1) -> WMON (token0)
             // amountSpecified = negative → exactOutput (we want WMON)
             PCS_POOL.swap(
                 address(this),
                 false, // USDC -> WMON
                 -int256(wmonToBuy),
-                1461446703485210103287273052203988822378723970341, // max sqrtPrice
+                sqrtLimit,
                 abi.encode(true, kuruVolWei)
             );
             return true;
@@ -154,19 +161,45 @@ contract ArbitragePancakeUSDC is IPancakeV3SwapCallback {
             );
             if (kuruVolWei == 0) return false;
 
+            // Buffer: Scale down maxQuoteSpend by 0.2% to ensure monBought >= monDebt
+            // after Kuru's 2bps taker fee (deducted from MON output)
+            maxQuoteSpend = (maxQuoteSpend * 9980) / 10000;
+
+            // Calculate price limit: Stop if PCS price drops to kuruAsk (plus margin)
+            // safeAsk = kuruAsk * 1.0007 (7bps buffer - matches Uniswap V4)
+            // For WMON/USDC pool: lower USDC/MON price = LOWER sqrtPrice
+            // zeroForOne=true means price decreases, so use safeAsk as lower bound
+            uint256 safeAsk = (kuruAsk * 10007) / 10000;
+            uint160 sqrtLimit = _priceToSqrtPriceUSDC(safeAsk);
+
             // zeroForOne = true → WMON (token0) -> USDC (token1)
             // We want USDC first to buy on Kuru
             PCS_POOL.swap(
                 address(this),
                 true, // WMON -> USDC
                 -int256(maxQuoteSpend),
-                4295128740, // min sqrtPrice
+                sqrtLimit,
                 abi.encode(false, kuruVolWei, maxQuoteSpend)
             );
             return true;
         }
 
         return false;
+    }
+
+    /// @notice Convert USDC/MON price (1e18) to sqrtPriceX96 for WMON/USDC pool
+    /// @dev Pool is WMON/USDC: sqrtPrice = sqrt(USDC/WMON) * 2^96
+    ///      price is in 1e18 format, need to convert to sqrtPriceX96
+    function _priceToSqrtPriceUSDC(
+        uint256 priceUsdcPerMon
+    ) internal pure returns (uint160) {
+        // For WMON/USDC pool: sqrtPrice = sqrt(price / PRICE_SCALE_FACTOR) * 2^96
+        // PRICE_SCALE_FACTOR = 1e30, price is in 1e18
+        // sqrtPrice = sqrt(price * 2^192 / 1e30)
+        uint256 sqrtPrice = FixedPointMathLib.sqrt(
+            FullMath.mulDiv(priceUsdcPerMon, 1 << 192, PRICE_SCALE_FACTOR)
+        );
+        return uint160(sqrtPrice);
     }
 
     // ============ PCS CALLBACK ============
