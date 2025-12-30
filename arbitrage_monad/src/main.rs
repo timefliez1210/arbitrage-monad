@@ -527,11 +527,12 @@ async fn run_monad_bot(bots: Vec<ArbBot>, private_key: String, ws_url: String) -
                             let parse_elapsed = receive_time.duration_since(loop_start);
                             
                             let block_timestamp = u64::from_str_radix(header.timestamp.trim_start_matches("0x"), 16).unwrap_or(0);
-                            let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                            let latency = now_unix.saturating_sub(block_timestamp);
+                            let now_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                            let block_timestamp_ms = block_timestamp * 1000;
+                            let latency_ms = now_unix_ms.saturating_sub(block_timestamp_ms);
                             
                             println!("\n══════════════════════════════════════════════════════════");
-                            println!("🚀 PROPOSED Block #{} | Latency: {}s", block_num, latency);
+                            println!("🚀 PROPOSED Block #{} | WS Delay: {}ms", block_num, latency_ms);
                             
                             // DEBUG: Print timing breakdown
                             if DEBUG_TIMING {

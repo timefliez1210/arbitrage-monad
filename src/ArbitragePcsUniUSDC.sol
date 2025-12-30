@@ -3,9 +3,6 @@ pragma solidity ^0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {
-    IERC20Metadata
-} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import {
     FixedPointMathLib
 } from "@kuru/contracts/libraries/FixedPointMathLib.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
@@ -30,9 +27,9 @@ import {IWMON} from "./interfaces/IWMON.sol";
 
 /// @title ArbitragePcsUniUSDC
 /// @notice Arbitrage between PancakeSwap V3 WMON/USDC and Uniswap V4 MON/USDC pools
-/// @dev PCS Pool: token0=WMON, token1=USDC (sqrtPrice = sqrt(USDC/WMON)) - DIRECT
+/// @dev Simplified: uses 80% of min liquidity, no sqrtPriceLimit (uses MIN/MAX)
+///      PCS Pool: token0=WMON, token1=USDC (sqrtPrice = sqrt(USDC/WMON)) - DIRECT
 ///      Uni Pool: currency0=MON, currency1=USDC (sqrtPrice = sqrt(USDC/MON)) - DIRECT
-///      Both pools have DIRECT relationship: higher sqrtPrice = more expensive MON
 contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -41,12 +38,16 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     // ============ ERRORS ============
     error Unauthorized();
     error InsufficientOutput();
-    error NotProfitable();
 
     // ============ CONSTANTS ============
     uint256 constant MIN_TRADE = 1e18; // 1 MON minimum
-    uint256 constant MAX_TRADE = 1000e18; // 1000 MON maximum
-    uint256 constant SAFETY_FACTOR = 3000; // 30% of calculated tradeable (in basis points)
+    uint256 constant MAX_TRADE = 20000e18; // 20k MON maximum
+    uint256 constant SIZING_PCT = 8000; // 80% of calculated tradeable
+
+    // Price limits - effectively "no limit"
+    uint160 constant MIN_SQRT_RATIO = 4295128739 + 1;
+    uint160 constant MAX_SQRT_RATIO =
+        1461446703485210103287273052203988822378723970342 - 1;
 
     // ============ IMMUTABLES ============
     IPancakeV3Pool public immutable PCS_POOL;
@@ -58,9 +59,7 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     Currency constant MON_CURRENCY = Currency.wrap(address(0));
     Currency public immutable USDC_CURRENCY;
 
-    uint256 constant BASE_MULTIPLIER = 1e18;
-    uint256 constant PRICE_SCALE_FACTOR = 1e30; // 18 + 18 - 6
-    uint256 public immutable SQRT_PRICE_SCALE;
+    uint256 constant PRICE_SCALE_FACTOR = 1e30;
 
     // ============ CONSTRUCTOR ============
     constructor(
@@ -76,8 +75,6 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
         USDC = IERC20(_usdc);
         USDC_CURRENCY = Currency.wrap(_usdc);
         owner = _owner;
-
-        SQRT_PRICE_SCALE = FixedPointMathLib.sqrt(PRICE_SCALE_FACTOR);
     }
 
     receive() external payable {}
@@ -90,8 +87,7 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
                 currency0: MON_CURRENCY,
                 currency1: USDC_CURRENCY,
                 fee: 500,
-                // MON/USDC TickSpacing is 10
-                tickSpacing: 10,
+                tickSpacing: 10, // MON/USDC uses tickSpacing=10
                 hooks: IHooks(address(0))
             });
     }
@@ -99,25 +95,15 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     // ============ PRICE QUERIES ============
 
     /// @notice Get PCS price (USDC per MON in 1e18)
-    /// @dev Pool is WMON/USDC: token0=WMON, token1=USDC (DIRECT relationship)
     function getPcsPrice() public view returns (uint256) {
         (uint160 sqrtPriceX96, , , , , , ) = PCS_POOL.slot0();
+        // PCS: token0=WMON, token1=USDC, sqrtPrice = sqrt(USDC/WMON)
         return
             FullMath.mulDiv(
                 uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
                 PRICE_SCALE_FACTOR,
                 1 << 192
             );
-    }
-
-    /// @notice Get PCS sqrtPriceX96 and liquidity
-    function getPcsState()
-        public
-        view
-        returns (uint160 sqrtPriceX96, uint128 liquidity)
-    {
-        (sqrtPriceX96, , , , , , ) = PCS_POOL.slot0();
-        liquidity = PCS_POOL.liquidity();
     }
 
     /// @notice Get Uni V4 price (USDC per MON in 1e18)
@@ -125,6 +111,7 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
         PoolKey memory key = getPoolKey();
         PoolId id = key.toId();
         (uint160 sqrtPriceX96, , , ) = PM.getSlot0(id);
+        // Uni: currency0=MON, currency1=USDC, sqrtPrice = sqrt(USDC/MON)
         return
             FullMath.mulDiv(
                 uint256(sqrtPriceX96) * uint256(sqrtPriceX96),
@@ -133,30 +120,25 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
             );
     }
 
-    /// @notice Get Uni V4 sqrtPriceX96 and liquidity
-    function getUniState()
-        public
-        view
-        returns (uint160 sqrtPriceX96, uint128 liquidity)
-    {
-        PoolKey memory key = getPoolKey();
-        PoolId id = key.toId();
-        (sqrtPriceX96, , , ) = PM.getSlot0(id);
-        liquidity = PM.getLiquidity(id);
-    }
-
     // ============ TRADE SIZE ESTIMATION ============
 
-    /// @notice Calculate optimal trade size using Uniswap V3/V4 liquidity math
-    /// @dev Both pools have DIRECT sqrtPrice relationship (same formula)
+    /// @notice Calculate trade size: 80% of min(PCS liquidity, Uni liquidity)
     function estimateTradeSize()
         public
         view
         returns (uint256 tradeSize, bool isForward)
     {
-        (uint160 pcsSqrt, uint128 pcsL) = getPcsState();
-        (uint160 uniSqrt, uint128 uniL) = getUniState();
+        // Get PCS state
+        (uint160 pcsSqrt, , , , , , ) = PCS_POOL.slot0();
+        uint128 pcsL = PCS_POOL.liquidity();
 
+        // Get Uni state
+        PoolKey memory key = getPoolKey();
+        PoolId id = key.toId();
+        (uint160 uniSqrt, , , ) = PM.getSlot0(id);
+        uint128 uniL = PM.getLiquidity(id);
+
+        // Convert to prices (both DIRECT: higher sqrtPrice = higher price)
         uint256 pcsPrice = FullMath.mulDiv(
             uint256(pcsSqrt) * uint256(pcsSqrt),
             PRICE_SCALE_FACTOR,
@@ -168,57 +150,46 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
             1 << 192
         );
 
+        // Determine direction
         if (pcsPrice < uniPrice) {
-            isForward = true;
+            isForward = true; // Buy on PCS (cheap), sell on Uni (expensive)
         } else if (uniPrice < pcsPrice) {
-            isForward = false;
+            isForward = false; // Buy on Uni (cheap), sell on PCS (expensive)
         } else {
             return (0, false); // No opportunity
         }
 
-        // Target price (midpoint)
+        // Target price is midpoint
         uint256 targetPrice = (pcsPrice + uniPrice) / 2;
-        uint160 targetSqrt = _priceToSqrtPrice(targetPrice);
 
-        // Both pools have DIRECT relationship, so same formula applies
-        // For token0 (MON/WMON): ΔX = L × (√Pb - √Pa) / (√Pa × √Pb)
+        // Calculate tradeable amounts using ΔY = L × |√Pb - √Pa|
+        uint160 targetSqrtPcs = _priceToSqrtPrice(targetPrice);
+        uint160 targetSqrtUni = _priceToSqrtPrice(targetPrice);
 
-        // PCS tradeable
-        uint256 deltaSqrtPcs = pcsSqrt > targetSqrt
-            ? uint256(pcsSqrt) - uint256(targetSqrt)
-            : uint256(targetSqrt) - uint256(pcsSqrt);
-        uint256 sqrtProductPcs = FullMath.mulDiv(
-            uint256(pcsSqrt),
-            uint256(targetSqrt),
+        uint256 deltaSqrtPcs = pcsSqrt > targetSqrtPcs
+            ? uint256(pcsSqrt) - uint256(targetSqrtPcs)
+            : uint256(targetSqrtPcs) - uint256(pcsSqrt);
+        uint256 pcsTradeable = FullMath.mulDiv(
+            uint256(pcsL),
+            deltaSqrtPcs,
             1 << 96
         );
-        uint256 pcsTradeableX = sqrtProductPcs > 0
-            ? FullMath.mulDiv(uint256(pcsL), deltaSqrtPcs, sqrtProductPcs)
-            : 0;
 
-        // Uni tradeable
-        uint256 deltaSqrtUni = uniSqrt > targetSqrt
-            ? uint256(uniSqrt) - uint256(targetSqrt)
-            : uint256(targetSqrt) - uint256(uniSqrt);
-        uint256 sqrtProductUni = FullMath.mulDiv(
-            uint256(uniSqrt),
-            uint256(targetSqrt),
+        uint256 deltaSqrtUni = uniSqrt > targetSqrtUni
+            ? uint256(uniSqrt) - uint256(targetSqrtUni)
+            : uint256(targetSqrtUni) - uint256(uniSqrt);
+        uint256 uniTradeable = FullMath.mulDiv(
+            uint256(uniL),
+            deltaSqrtUni,
             1 << 96
         );
-        uint256 uniTradeableX = sqrtProductUni > 0
-            ? FullMath.mulDiv(uint256(uniL), deltaSqrtUni, sqrtProductUni)
-            : 0;
 
-        // Take minimum (bottleneck)
-        tradeSize = pcsTradeableX < uniTradeableX
-            ? pcsTradeableX
-            : uniTradeableX;
+        // Take minimum and apply 80% sizing
+        tradeSize = pcsTradeable < uniTradeable ? pcsTradeable : uniTradeable;
+        tradeSize = (tradeSize * SIZING_PCT) / 10000;
 
-        // Apply safety factor (30%)
-        tradeSize = (tradeSize * SAFETY_FACTOR) / 10000;
-
-        // Clamp to bounds
-        if (tradeSize < MIN_TRADE) tradeSize = MIN_TRADE;
+        // Clamp
+        if (tradeSize < MIN_TRADE) tradeSize = 0;
         if (tradeSize > MAX_TRADE) tradeSize = MAX_TRADE;
     }
 
@@ -230,12 +201,10 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
         returns (bool profitable, uint256 expectedProfit)
     {
         (uint256 tradeSize, bool isForward) = estimateTradeSize();
-
         if (tradeSize == 0) return (false, 0);
 
         uint256 pcsPrice = getPcsPrice();
         uint256 uniPrice = getUniPrice();
-
         uint256 feeBuffer = (pcsPrice * 15) / 10000; // 15bps
 
         uint256 spread;
@@ -248,14 +217,13 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
         }
 
         expectedProfit = FullMath.mulDiv(spread, tradeSize, 1e18);
-        profitable = expectedProfit > 1e16;
+        profitable = expectedProfit > 5e17; // 0.5 USDC min profit
     }
 
-    // ============ EXECUTE (AUTONOMOUS) ============
+    // ============ EXECUTE ============
 
     function execute() external returns (bool) {
         (uint256 tradeSize, bool isForward) = estimateTradeSize();
-
         if (tradeSize < MIN_TRADE) return false;
 
         uint256 pcsPrice = getPcsPrice();
@@ -263,10 +231,10 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
         uint256 feeBuffer = (pcsPrice * 10) / 10000;
 
         if (isForward && pcsPrice + feeBuffer < uniPrice) {
-            _executeForward(tradeSize, uniPrice);
+            _executeForward(tradeSize);
             return true;
         } else if (!isForward && uniPrice + feeBuffer < pcsPrice) {
-            _executeReverse(tradeSize, pcsPrice);
+            _executeReverse(tradeSize);
             return true;
         }
 
@@ -274,55 +242,60 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     }
 
     // ============ FORWARD: PCS → UNI ============
+    // Buy WMON on PCS (cheap), unwrap, sell MON on Uni (expensive)
 
-    function _executeForward(uint256 amountMon, uint256 uniPrice) internal {
-        // PCS: buying WMON (zeroForOne=false, USDC→WMON)
-        // DIRECT relationship: higher price = higher sqrtPrice
-        // Limit: stop if pcsPrice rises to uniPrice
-        uint256 safeBid = (uniPrice * 9980) / 10000;
-        uint160 pcsLimit = _priceToSqrtPrice(safeBid);
-
+    function _executeForward(uint256 amountMon) internal {
+        // PCS: zeroForOne=false (buy token0=WMON with token1=USDC)
+        // exactOutput: we want amountMon WMON out
         PCS_POOL.swap(
             address(this),
-            false, // USDC → WMON
-            -int256(amountMon),
-            pcsLimit,
-            abi.encode(true, amountMon, uniPrice)
+            false,
+            -int256(amountMon), // Negative = exactOutput
+            MAX_SQRT_RATIO, // No limit for zeroForOne=false
+            abi.encode(true, amountMon)
         );
     }
 
     // ============ REVERSE: UNI → PCS ============
+    // Buy MON on Uni (cheap), wrap, sell WMON on PCS (expensive)
 
-    function _executeReverse(uint256 amountMon, uint256 pcsPrice) internal {
-        // Uni: buying MON (zeroForOne=false)
-        uint256 safeAsk = (pcsPrice * 9980) / 10000;
-        uint160 uniLimit = _priceToSqrtPrice(safeAsk);
-
-        PM.unlock(abi.encode(false, amountMon, pcsPrice, uniLimit));
+    function _executeReverse(uint256 amountMon) internal {
+        PM.unlock(abi.encode(false, amountMon));
     }
 
     // ============ PCS CALLBACK ============
 
     function pancakeV3SwapCallback(
-        int256 amount0Delta, // WMON delta
-        int256 amount1Delta, // USDC delta
+        int256 amount0Delta,
+        int256 amount1Delta,
         bytes calldata data
     ) external {
         if (msg.sender != address(PCS_POOL)) revert Unauthorized();
 
-        (bool isForward, , uint256 uniPrice) = abi.decode(
-            data,
-            (bool, uint256, uint256)
-        );
+        (bool isForward, ) = abi.decode(data, (bool, uint256));
 
         if (isForward) {
+            // Forward: we received WMON (amount0<0), owe USDC (amount1>0)
             uint256 wmonReceived = uint256(-amount0Delta);
             uint256 usdcOwed = uint256(amount1Delta);
 
+            // Unwrap WMON to MON
             WMON.withdraw(wmonReceived);
 
-            uint160 uniLimit = _priceToSqrtPrice((uniPrice * 9993) / 10000);
-            PM.unlock(abi.encode(true, wmonReceived, usdcOwed, uniLimit));
+            // Sell MON on Uni for USDC
+            PM.unlock(abi.encode(true, wmonReceived, usdcOwed));
+        } else {
+            // Reverse callback: we sold WMON (amount0>0), received USDC (amount1<0)
+            uint256 wmonOwed = uint256(amount0Delta);
+
+            // Pay WMON to PCS
+            WMON.transfer(address(PCS_POOL), wmonOwed);
+
+            // Send profit
+            uint256 profit = USDC.balanceOf(address(this));
+            if (profit > 0) {
+                USDC.transfer(owner, profit);
+            }
         }
     }
 
@@ -333,95 +306,93 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
     ) external override returns (bytes memory) {
         if (msg.sender != address(PM)) revert Unauthorized();
 
-        (
-            bool isForward,
-            uint256 amountMon,
-            uint256 amountUsdcOrPcsPrice,
-            uint160 sqrtLimit
-        ) = abi.decode(data, (bool, uint256, uint256, uint160));
+        bool isForward = abi.decode(data, (bool));
 
         if (isForward) {
-            uint256 usdcOwed = amountUsdcOrPcsPrice;
+            // Forward: sell MON for USDC, pay back PCS
+            (, uint256 monAmount, uint256 usdcOwed) = abi.decode(
+                data,
+                (bool, uint256, uint256)
+            );
 
             PoolKey memory key = getPoolKey();
+
+            // Swap MON for USDC (zeroForOne=true, exactInput)
             BalanceDelta delta = PM.swap(
                 key,
                 IPoolManager.SwapParams({
-                    zeroForOne: true, // MON → USDC
-                    amountSpecified: int256(amountMon),
-                    sqrtPriceLimitX96: sqrtLimit
+                    zeroForOne: true,
+                    amountSpecified: int256(monAmount),
+                    sqrtPriceLimitX96: MIN_SQRT_RATIO
                 }),
                 ""
             );
 
-            int128 monSpent = delta.amount0();
-            int128 usdcReceived = -delta.amount1();
-
+            // Settle: pay MON
+            uint128 monSpent = uint128(delta.amount0());
             if (monSpent > 0) {
-                PM.settle{value: uint256(uint128(monSpent))}();
+                PM.settle{value: monSpent}();
             }
 
+            // Take: receive USDC
+            uint128 usdcReceived = uint128(-delta.amount1());
             if (usdcReceived > 0) {
-                PM.take(
-                    USDC_CURRENCY,
-                    address(this),
-                    uint256(uint128(usdcReceived))
-                );
+                PM.take(USDC_CURRENCY, address(this), usdcReceived);
             }
 
-            uint256 usdcBal = USDC.balanceOf(address(this));
-            if (usdcBal < usdcOwed) revert InsufficientOutput();
+            // Pay back PCS
+            if (usdcReceived < usdcOwed) revert InsufficientOutput();
             USDC.transfer(address(PCS_POOL), usdcOwed);
 
+            // Send profit
             uint256 profit = USDC.balanceOf(address(this));
             if (profit > 0) {
                 USDC.transfer(owner, profit);
             }
         } else {
-            uint256 pcsPrice = amountUsdcOrPcsPrice;
+            // Reverse: buy MON with USDC, then sell on PCS
+            (, uint256 monAmount) = abi.decode(data, (bool, uint256));
 
             PoolKey memory key = getPoolKey();
+
+            // Swap USDC for MON (zeroForOne=false, exactOutput)
             BalanceDelta delta = PM.swap(
                 key,
                 IPoolManager.SwapParams({
-                    zeroForOne: false, // USDC → MON
-                    amountSpecified: -int256(amountMon),
-                    sqrtPriceLimitX96: sqrtLimit
+                    zeroForOne: false,
+                    amountSpecified: -int256(monAmount),
+                    sqrtPriceLimitX96: MAX_SQRT_RATIO
                 }),
                 ""
             );
 
-            int128 monReceived = -delta.amount0();
-            int128 usdcDebt = delta.amount1();
-
+            // Take: receive MON
+            uint128 monReceived = uint128(-delta.amount0());
             if (monReceived > 0) {
-                PM.take(
-                    MON_CURRENCY,
-                    address(this),
-                    uint256(uint128(monReceived))
-                );
+                PM.take(MON_CURRENCY, address(this), monReceived);
             }
 
-            uint256 monBal = address(this).balance;
-            WMON.deposit{value: monBal}();
+            // Wrap MON to WMON
+            WMON.deposit{value: address(this).balance}();
 
-            // Sell WMON on PCS: zeroForOne=true (WMON → USDC)
-            uint160 pcsLimit = _priceToSqrtPrice((pcsPrice * 10007) / 10000);
-
+            // Swap WMON for USDC on PCS (zeroForOne=true: token0→token1)
             PCS_POOL.swap(
                 address(this),
-                true, // WMON → USDC
-                int256(WMON.balanceOf(address(this))),
-                pcsLimit,
-                abi.encode(false)
+                true,
+                int256(WMON.balanceOf(address(this))), // exactInput
+                MIN_SQRT_RATIO,
+                abi.encode(false, uint256(0))
             );
 
+            // Settle USDC debt to Uni
+            uint128 usdcDebt = uint128(delta.amount1());
             uint256 usdcBal = USDC.balanceOf(address(this));
-            if (int256(usdcBal) < usdcDebt) revert InsufficientOutput();
+            if (usdcBal < usdcDebt) revert InsufficientOutput();
 
-            USDC.transfer(address(PM), uint256(uint128(usdcDebt)));
+            USDC.transfer(address(PM), usdcDebt);
             PM.settle();
 
+            // Send profit
             uint256 profit = USDC.balanceOf(address(this));
             if (profit > 0) {
                 USDC.transfer(owner, profit);
@@ -433,35 +404,24 @@ contract ArbitragePcsUniUSDC is IPancakeV3SwapCallback, IUnlockCallback {
 
     // ============ SQRT PRICE CONVERSION ============
 
-    /// @notice Convert USDC/MON price (1e18) to sqrtPriceX96
-    /// @dev Both PCS and Uni have DIRECT relationship
     function _priceToSqrtPrice(
         uint256 priceUsdcPerMon
     ) internal pure returns (uint160) {
-        uint256 sqrtPrice = FixedPointMathLib.sqrt(
-            FullMath.mulDiv(priceUsdcPerMon, 1 << 192, PRICE_SCALE_FACTOR)
-        );
-        return uint160(sqrtPrice);
+        // Both pools DIRECT: sqrtPrice = sqrt(USDC/MON)
+        uint256 root = FixedPointMathLib.sqrt(priceUsdcPerMon);
+        return uint160(FullMath.mulDiv(root, 1 << 96, 1e9));
     }
 
     // ============ ADMIN ============
 
     function emergencyWithdraw() external {
         require(msg.sender == owner, "Not owner");
-
+        uint256 usdcBal = USDC.balanceOf(address(this));
+        uint256 wmonBal = WMON.balanceOf(address(this));
+        if (usdcBal > 0) USDC.transfer(owner, usdcBal);
+        if (wmonBal > 0) WMON.transfer(owner, wmonBal);
         if (address(this).balance > 0) {
             payable(owner).call{value: address(this).balance}("");
-        }
-
-        uint256 wmonBal = WMON.balanceOf(address(this));
-        if (wmonBal > 0) {
-            WMON.withdraw(wmonBal);
-            payable(owner).call{value: address(this).balance}("");
-        }
-
-        uint256 usdcBal = USDC.balanceOf(address(this));
-        if (usdcBal > 0) {
-            USDC.transfer(owner, usdcBal);
         }
     }
 }

@@ -51,6 +51,11 @@ name = "dRPC"
 env = "CHAINSTACK_HTTP"
 name = "Chainstack"
 
+[[broadcast]]
+env = "VALIDATION_CLOUD_HTTPS"
+name = "Validation Cloud"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRIORITY FEE CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -59,7 +64,7 @@ name = "Chainstack"
 # Base priority fee in gwei (applied to all transactions)
 base_priority_gwei = 30
 # Maximum priority fee cap in gwei (prevents overpaying)
-max_priority_gwei = 300
+max_priority_gwei = 200
 # Base max fee per gas in gwei (added to priority fee)
 base_max_fee_gwei = 100
 
@@ -95,6 +100,14 @@ name = "AUSD Uni"
 [[bots]]
 address = "0x386fa87ff4ca03f84663b5a109a33518c3ca3ad2"
 name = "AUSD Pancake"
+
+#[[bots]]
+#address = "0xfd62cae1b831eaeaa33efe540c7ec3e8f48500ea"
+#name = "AUSD Pancake/Uni"
+
+#[[bots]]
+#address = "0xc2adb9178747f1ae020c9dfd2d968d77f57a3c82"
+#name = "USDC Pancake/Uni"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING CONFIGURATION
