@@ -1,27 +1,19 @@
-kuru flow 0xb3e6778480b2E488385E8205eA05E20060B813cb
-kuru flow router 0x465D06d4521ae9Ce724E0c182Daad5D8a2Ff7040
-kuru amm vault impl 0xDC2A82E321866C30d62077945e067172C5f970F4
-kuru forwarder 0x974E61BBa9C4704E8Bcc1923fdC3527B41323FAA
-kuru forwarder impl 0xbf6Cc109c6eBcA4B28e3e51FD8798294599CFe2A
-kuru utils 0xD8Ea5Ea6A4ebc202C77c795cb2a35835afd127f6
-margin account 0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5
-margin account impl 0x57cF97FE1FAC7D78B07e7e0761410cb2e91F0ca7
-monad deployer 0xe29309e308af3EE3B1a414E97c37A58509f27D1E
-order book impl 0xea2Cc8769Fb04Ff1893Ed11cf517b7F040C823CD
-router impl 0x0F2A2a5c0A78c406c26Adb2F1681D3e47322A9CD
-    let bots = vec![
-        ArbBot {
-            address: Address::from_str("0xcfde93b0e118a23d080d7e65b4ec162aa48aa73e")?, // USDC Arb
-            name: "USDC".to_string(),
-        },
-        ArbBot {
-            address: Address::from_str("0x058b62eb0ff589176a26034e69f6f8ccf619c0ef")?, // AUSD Arb
-            name: "AUSD".to_string(),
-        },
-    ];
+## Kuru Internal Contracts
 
+| Contract | Address |
+|----------|---------|
+| kuru flow | `0xb3e6778480b2E488385E8205eA05E20060B813cb` |
+| kuru flow router | `0x465D06d4521ae9Ce724E0c182Daad5D8a2Ff7040` |
+| kuru amm vault impl | `0xDC2A82E321866C30d62077945e067172C5f970F4` |
+| kuru forwarder | `0x974E61BBa9C4704E8Bcc1923fdC3527B41323FAA` |
+| kuru forwarder impl | `0xbf6Cc109c6eBcA4B28e3e51FD8798294599CFe2A` |
+| kuru utils | `0xD8Ea5Ea6A4ebc202C77c795cb2a35835afd127f6` |
+| margin account | `0x2A68ba1833cDf93fa9Da1EEbd7F46242aD8E90c5` |
+| margin account impl | `0x57cF97FE1FAC7D78B07e7e0761410cb2e91F0ca7` |
+| monad deployer | `0xe29309e308af3EE3B1a414E97c37A58509f27D1E` |
+| order book impl | `0xea2Cc8769Fb04Ff1893Ed11cf517b7F040C823CD` |
+| router impl | `0x0F2A2a5c0A78c406c26Adb2F1681D3e47322A9CD` |
 
-mainnet RPC URL https://monad-mainnet.infura.io/v3/747d75b9b2104f729b6a7a9f3c34a31d
 example order book implementation MON/USDC for testing 0x122C0D8683Cab344163fB73E28E741754257e3Fa
 
 ### Pools Discovered

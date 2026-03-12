@@ -16,7 +16,9 @@ docs/
 .env.*
 *.env
 **/.env
-UTC--2025-12-19T00-22-26.843Z--0x0000000383dcfdc98cfda69dd8a9eeec239e35e1
+# But do track the example template
+!.env.example
+!**/.env.example
 
 # Rust build artifacts
 **/target/
