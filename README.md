@@ -49,7 +49,7 @@ Single-socket design: one WebSocket handles both `monadNewHeads` subscriptions a
 | `ArbitragePcsUniAUSD.sol` | AUSD/WMON | PancakeSwap V3 ↔ Uniswap V4 |
 | `ArbitragePcsUniUSDC.sol` | WMON/USDC | PancakeSwap V3 ↔ Uniswap V4 |
 
-Deployed addresses are in [CONTRACTS.md](CONTRACTS.md).
+Deployed addresses are not tracked in this repo.
 
 ## Setup
 
