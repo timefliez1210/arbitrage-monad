@@ -39,5 +39,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Personal notes / deployment history / live tx logs
+CONTRACTS.md
+deployments.md
+arbitrage_monad/transactions_monad.md
+
 # Keystore files
 arbitrage_monad/UTC--*
