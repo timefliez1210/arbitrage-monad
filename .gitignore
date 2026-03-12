@@ -22,7 +22,6 @@ docs/
 
 # Rust build artifacts
 **/target/
-Cargo.lock
 
 # Node.js
 node_modules/
