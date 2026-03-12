@@ -100,12 +100,6 @@ VALIDATION_CLOUD_HTTPS=https://...
 
 Edit `arbitrage_monad/config.toml` to configure active bot addresses, primary endpoints, fee scaling, gas limit, and cooldown blocks — no recompilation needed.
 
-### Deploying Contracts
-
-```bash
-forge script script/DeployArbitrageAUSD.s.sol --rpc-url $RPC --broadcast
-```
-
 ### Running
 
 ```bash
